@@ -1,0 +1,27 @@
+[Unit]
+Description=Helix Reborn agent: one poll tick
+Wants=network-online.target
+After=network-online.target agent-firewall.service
+Requires=agent-firewall.service
+
+[Service]
+Type=oneshot
+User=agent-ctl
+Group=agentwork
+EnvironmentFile=/etc/agent/agent.env
+ExecStart=/opt/agent/agent-poll.sh
+TimeoutStartSec=2h
+
+# /run/agent-poll (the flock) and /var/lib/agent-ctl (agent-ctl's private clone, gh config).
+RuntimeDirectory=agent-poll
+StateDirectory=agent-ctl
+StateDirectoryMode=0700
+
+# Hardening. Not NoNewPrivileges: that would block the single sudo to run-claude.sh.
+# Children inherit these mounts, so the agent user's own writable places must be listed:
+# its home (Claude, uv, fnm, dotnet caches) and /run/user (rootless Docker). Ordinary file
+# permissions still keep agent-ctl out of them.
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ReadWritePaths=/srv/agent-work /var/log/agent /home/agent -/run/user -/run/sudo

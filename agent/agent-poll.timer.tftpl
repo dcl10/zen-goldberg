@@ -1,0 +1,10 @@
+[Unit]
+Description=Poll GitHub for Helix Reborn agent work
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=${poll_interval}
+Unit=agent-poll.service
+
+[Install]
+WantedBy=timers.target
