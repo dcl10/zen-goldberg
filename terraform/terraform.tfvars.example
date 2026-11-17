@@ -1,0 +1,35 @@
+# Copy to terraform.tfvars (gitignored) and fill in the placeholders.
+# Tokens for Terraform itself come from the environment, not this file:
+#   export DIGITALOCEAN_TOKEN=...   # DO API token
+#   export GITHUB_TOKEN=...         # Dan's own PAT, admin on the repo
+
+# Droplet
+region            = "lon1"
+droplet_size      = "s-2vcpu-4gb"
+ssh_public_key    = "ssh-ed25519 AAAA... you@your-machine"
+ssh_allowed_cidrs = ["203.0.113.7/32"] # your public IP (curl -s https://ifconfig.me)
+
+# Secrets (end up in user-data, so in the local state: never commit either)
+do_model_access_key = "doo_v1_..."
+bot_github_token    = "ghp_..."
+
+# Model
+model = "sonnet"
+# small_fast_model = ""  # exact ID from /v1/models, e.g. the Haiku 5.5 one
+max_turns     = 80
+job_timeout   = "45m"
+poll_interval = "3min"
+
+# GitHub
+github_owner   = "dcl10"
+github_repo    = "helix-reborn"
+default_branch = "main"
+owner_login    = "dcl10"
+bot_login      = "helix-reborn-bot"
+bot_git_name   = "helix-reborn-bot"
+bot_git_email  = "357983340+helix-reborn-bot@users.noreply.github.com"
+
+# Behaviour
+auto_merge_on_approval = true
+enable_ruleset         = true # helix-reborn is public, so rulesets are enforced on GitHub Free
+required_status_checks = []   # e.g. ["run_unit_tests", "format_python_code", "code_quality_check"] once CI exists

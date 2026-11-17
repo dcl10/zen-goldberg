@@ -1,0 +1,52 @@
+#cloud-config
+# Rendered by Terraform (droplet.tf). Provisioning steps live in /opt/agent/bootstrap.sh.
+
+disable_root: false
+ssh_pwauth: false
+ssh_authorized_keys:
+  - ${jsonencode(ssh_public_key)}
+
+groups:
+  - agentwork
+
+users:
+  - default
+  # Runs the poll loop; holds the GitHub token. No Docker, no general sudo.
+  - name: agent-ctl
+    gecos: Helix agent controller
+    shell: /bin/bash
+    lock_passwd: true
+    groups: [agentwork]
+  # Runs Claude; holds the model key, never the GitHub token. Rootless Docker only.
+  - name: agent
+    gecos: Helix agent worker
+    shell: /bin/bash
+    lock_passwd: true
+    groups: [agentwork]
+
+package_update: true
+packages:
+  - git
+  - jq
+  - curl
+  - unzip
+  - ca-certificates
+  - build-essential
+  - iptables
+  - uidmap
+  - dbus-user-session
+  - slirp4netns
+  - libicu74
+
+write_files:
+%{ for f in files ~}
+  - path: ${f.path}
+    encoding: b64
+    content: ${f.content}
+    owner: ${f.owner}
+    permissions: '${f.permissions}'
+    defer: ${f.defer}
+%{ endfor ~}
+
+runcmd:
+  - [bash, /opt/agent/bootstrap.sh]
