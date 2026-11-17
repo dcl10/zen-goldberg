@@ -78,8 +78,11 @@ terraform plan
 terraform apply
 ```
 
-This creates a DO project `helix-agent` with the Droplet in it, a firewall (SSH from
-`ssh_allowed_cidrs` only), the six labels, and the default-branch ruleset.
+This creates a DO project `helix-agent` holding the Droplet and a reserved IP, a firewall
+(SSH from `ssh_allowed_cidrs` only), the six labels, and the default-branch ruleset.
+
+The reserved IP gives the box a fixed hostname, `<reserved-ip>.sslip.io`
+(`terraform output -raw hostname`), which stays the same when the Droplet is replaced.
 
 First boot takes roughly 10 minutes (toolchains, Docker). Follow it with:
 
@@ -91,7 +94,7 @@ $(terraform output -raw log_tail_command)         # the poll loop
 ### 4. Check the box
 
 ```bash
-ssh root@$(terraform output -raw droplet_ip)
+$(terraform output -raw ssh_command)
 sudo -l -U agent-ctl                               # only /opt/agent/run-claude.sh, as agent
 sudo -u agent cat /etc/agent/agent.env             # Permission denied
 sudo -u agent curl -m3 http://169.254.169.254      # rejected
@@ -123,7 +126,9 @@ get `agent:blocked` and wait until the first PR merges.
 ## Changing settings
 
 Any change to the scripts, prompts or variables changes the user-data, so `terraform apply`
-**replaces the Droplet**. That's fine: it's stateless.
+**replaces the Droplet**. That's fine: it's stateless, and the reserved IP and hostname move to
+the new one. The new box has new SSH host keys, so clear the old ones first:
+`ssh-keygen -R $(terraform output -raw hostname)`.
 
 If torch plus the Docker services run out of memory, set `droplet_size = "s-4vcpu-8gb"` (about $48/month).
 
@@ -132,11 +137,12 @@ If torch plus the Docker services run out of memory, set `droplet_size = "s-4vcp
 Droplets bill while powered off, so destroy rather than stop:
 
 ```bash
-terraform apply -var droplet_enabled=false   # removes only the Droplet; labels, ruleset, firewall stay
+terraform apply -var droplet_enabled=false   # removes only the Droplet; reserved IP, labels, ruleset, firewall stay
 terraform destroy                            # everything
 ```
 
-`s-2vcpu-4gb` costs about $24/month if left on. Model usage is billed separately from the prepaid
+`s-2vcpu-4gb` costs about $24/month if left on. The reserved IP is free while assigned, but DO
+bills a small hourly fee for it while the Droplet is gone; `terraform destroy` releases it. Model usage is billed separately from the prepaid
 balance (roughly $2 / $10 per million input / output tokens for Sonnet 5.5). The cost Claude Code
 reports may not match DO's billing.
 

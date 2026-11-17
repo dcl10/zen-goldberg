@@ -76,7 +76,20 @@ resource "digitalocean_project" "agent" {
   description = "Unattended Claude Code bot for Helix Reborn (managed by Terraform)."
   purpose     = "Service or API"
   environment = "Development"
-  resources   = digitalocean_droplet.agent[*].urn
+  resources   = concat([digitalocean_reserved_ip.agent.urn], digitalocean_droplet.agent[*].urn)
+}
+
+# A fixed address (and so a fixed <ip>.sslip.io hostname) that survives the Droplet being
+# replaced or destroyed. Free while assigned; DO bills a small hourly fee while it isn't.
+resource "digitalocean_reserved_ip" "agent" {
+  region = var.region
+}
+
+resource "digitalocean_reserved_ip_assignment" "agent" {
+  count = var.droplet_enabled ? 1 : 0
+
+  ip_address = digitalocean_reserved_ip.agent.ip_address
+  droplet_id = digitalocean_droplet.agent[0].id
 }
 
 resource "digitalocean_tag" "agent" {
