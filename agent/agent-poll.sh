@@ -24,6 +24,12 @@ LOG_DIR=/var/log/agent
 PROMPTS=/opt/agent
 LOCK=${RUNTIME_DIRECTORY:-/run/agent-poll}/lock
 MAX_BODY=60000
+# After the model provider refuses a run for quota (HTTP 429), no model jobs until this file's
+# epoch time; the issue or PR gets agent:rate-limited and is retried then.
+RATE_LIMIT_FILE=$STATE_DIR/rate-limited-until
+RATE_LIMIT_BACKOFF=${AGENT_RATE_LIMIT_BACKOFF:-3600}
+# Marks the bot's rate-limit comments, which aren't "activity" for [NEW] feedback on a PR.
+RATE_LIMIT_MARK='<!-- agent:rate-limited -->'
 
 export GH_REPO=$R GH_CONFIG_DIR=$STATE_DIR/gh GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 NO_COLOR=1
 export GIT_TERMINAL_PROMPT=0
@@ -74,7 +80,8 @@ bot_last_activity() {
   local c m
   c=$(api_all "repos/$R/pulls/$1/commits?per_page=100" | jq -r 'map(.commit.committer.date) | max // ""')
   m=$(api_all "repos/$R/issues/$1/comments?per_page=100" |
-    jq -r --arg b "$AGENT_BOT" 'map(select(.user.login == $b) | .created_at) | max // ""')
+    jq -r --arg b "$AGENT_BOT" --arg mark "$RATE_LIMIT_MARK" \
+      'map(select(.user.login == $b and ((.body // "") | contains($mark) | not)) | .created_at) | max // ""')
   printf '%s\n%s\n' "$c" "$m" | sort | tail -n 1
 }
 
@@ -164,6 +171,39 @@ run_job() {
 }
 
 job_failed() { [[ $JOB_RC -ne 0 || $JOB_IS_ERROR == true ]]; }
+
+# The provider refused the run for quota. Claude Code then ends with a result like
+# "API Error: Request rejected (429) · Rate limit exceeded: tokens_per_day."
+job_rate_limited() {
+  local first=${JOB_RESULT%%$'\n'*}
+  job_failed && [[ $first == "API Error:"* && $first =~ (\(429\)|[Rr]ate\ limit) ]]
+}
+
+# True while a rate-limit pause is running.
+rate_limited() {
+  local resume
+  [[ -s $RATE_LIMIT_FILE ]] || return 1
+  resume=$(<"$RATE_LIMIT_FILE")
+  [[ $resume =~ ^[0-9]+$ ]] && (($(date +%s) < resume))
+}
+
+# rate_limit_requeue <issue-or-pr> <already-rate-limited>: pause model jobs, label <n> for a
+# retry when the pause ends, and comment (once, not on every failed retry).
+rate_limit_requeue() {
+  local n=$1 already=$2 resume when
+  resume=$(($(date +%s) + RATE_LIMIT_BACKOFF))
+  printf '%s\n' "$resume" >"$RATE_LIMIT_FILE"
+  when=$(date -u -d "@$resume" '+%Y-%m-%d %H:%M UTC')
+  label_add "$n" agent:rate-limited
+  log "#$n: rate limited; no model jobs until $when"
+  [[ $already == true ]] && return
+  {
+    printf '%s\n**The model provider rate-limited this run.** I'\''ll retry after %s, ' "$RATE_LIMIT_MARK" "$when"
+    printf 'and every %s minutes after that until it gets through. Remove `agent:rate-limited` to cancel.\n\n' \
+      "$((RATE_LIMIT_BACKOFF / 60))"
+    printf '%s\n' "$JOB_RESULT"
+  } | comment_run "$n"
+}
 
 # push <sha> <branch> [--force]
 push() {
@@ -354,6 +394,14 @@ revise_one() {
         log "PR #$n: agent label added by '$labeler', not $AGENT_OWNER; ignoring it"
       fi
     fi
+    if [[ -z $reason ]] && has_label "$pr" agent:rate-limited; then
+      labeler=$(last_labeler "$n" agent:rate-limited)
+      if [[ $labeler == "$AGENT_BOT" ]]; then
+        reason="a rate-limit retry"
+      else
+        log "PR #$n: agent:rate-limited added by '$labeler', not $AGENT_BOT; ignoring it"
+      fi
+    fi
     if [[ -z $reason ]] && ! has_label "$pr" agent:failed; then
       review=$(owner_latest_review "$n")
       if [[ $(jq -r '.state // ""' <<<"$review") == CHANGES_REQUESTED ]]; then
@@ -371,15 +419,17 @@ revise_one() {
 }
 
 do_revise() {
-  local pr=$1 n branch issue sha title last job prompt feedback
+  local pr=$1 n branch issue sha title last job prompt feedback was_limited=false
   n=$(jq -r .number <<<"$pr")
   branch=$(jq -r .head.ref <<<"$pr")
   sha=$(jq -r .head.sha <<<"$pr")
   title=$(jq -r .title <<<"$pr")
   issue=${branch#agent/issue-}
+  has_label "$pr" agent:rate-limited && was_limited=true
 
   label_rm "$n" agent
   label_rm "$n" agent:failed
+  label_rm "$n" agent:rate-limited
   label_add "$n" agent:working
 
   last=$(bot_last_activity "$n")
@@ -427,6 +477,13 @@ do_revise() {
   pr_body_update_usage "$n" "$job/pr-body" || pr_body_update_usage "$n" "$job/pr-body" ||
     log "PR #$n: couldn't update the token usage in the PR body (the comment below still has this run's)"
 
+  # Any partial commits are already pushed, so the retry carries on from them.
+  if job_rate_limited && [[ $pushed == true ]]; then
+    rate_limit_requeue "$n" "$was_limited"
+    label_rm "$n" agent:working
+    return
+  fi
+
   if [[ -n $JOB_NEEDS ]]; then
     body=$JOB_NEEDS
   elif [[ -n $JOB_RESULT ]]; then
@@ -468,13 +525,19 @@ open_blockers() {
 }
 
 pick_issue() {
-  local issue n labeler blockers
+  local issue n labeler blockers trigger who
   while read -r issue; do
     [[ -n $issue ]] || continue
     n=$(jq -r .number <<<"$issue")
-    labeler=$(last_labeler "$n" agent)
-    if [[ $labeler != "$AGENT_OWNER" ]]; then
-      log "#$n: skipped, agent label last added by '$labeler', not $AGENT_OWNER"
+    # Queued by the owner (agent), or by the bot itself for a rate-limit retry.
+    if has_label "$issue" agent; then
+      trigger=agent who=$AGENT_OWNER
+    else
+      trigger=agent:rate-limited who=$AGENT_BOT
+    fi
+    labeler=$(last_labeler "$n" "$trigger")
+    if [[ $labeler != "$who" ]]; then
+      log "#$n: skipped, $trigger label last added by '$labeler', not $who"
       continue
     fi
     blockers=$(open_blockers "$n" "$(jq -r '.body // ""' <<<"$issue")")
@@ -487,20 +550,23 @@ pick_issue() {
     do_issue "$issue"
     RAN_JOB=1
     return
-  done < <(api_all "repos/$R/issues?state=open&labels=agent&creator=$AGENT_OWNER&sort=created&direction=asc&per_page=100" |
-    jq -c --arg o "$AGENT_OWNER" '.[] | select((.pull_request | not) and .user.login == $o)')
+  done < <(api_all "repos/$R/issues?state=open&creator=$AGENT_OWNER&sort=created&direction=asc&per_page=100" |
+    jq -c --arg o "$AGENT_OWNER" '.[] | select((.pull_request | not) and .user.login == $o
+      and any(.labels[]; .name == "agent" or .name == "agent:rate-limited"))')
 }
 
 do_issue() {
-  local issue=$1 n title branch base job comments
+  local issue=$1 n title branch base job comments was_limited=false
   n=$(jq -r .number <<<"$issue")
   title=$(jq -r .title <<<"$issue")
   branch=agent/issue-$n
+  has_label "$issue" agent:rate-limited && was_limited=true
   log "#$n: starting ($title)"
 
   label_rm "$n" agent
   label_rm "$n" agent:failed
   label_rm "$n" agent:needs-info
+  label_rm "$n" agent:rate-limited
   label_add "$n" agent:working
 
   base=$(git -C "$CLONE" rev-parse "refs/remotes/origin/$AGENT_DEFAULT_BRANCH")
@@ -520,6 +586,12 @@ do_issue() {
   issue_usage_add "$n" # before any early return: failed runs count toward the issue's total
 
   label_rm "$n" agent:working
+
+  # Partial commits aren't pushed: the retry starts again from the default branch.
+  if job_rate_limited; then
+    rate_limit_requeue "$n" "$was_limited"
+    return
+  fi
 
   if [[ -n $JOB_NEEDS ]] && ((JOB_COMMITS == 0)); then
     {
@@ -600,6 +672,10 @@ main() {
   if [[ $AGENT_AUTO_MERGE == true ]]; then
     merge_approved
     sync_clone
+  fi
+  if rate_limited; then
+    log "rate limited until $(date -u -d "@$(<"$RATE_LIMIT_FILE")" '+%Y-%m-%d %H:%M UTC'); no model jobs this tick"
+    exit 0
   fi
   revise_one
   [[ $RAN_JOB == 1 ]] && exit 0
