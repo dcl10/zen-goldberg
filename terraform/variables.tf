@@ -43,7 +43,7 @@ variable "droplet_image" {
 }
 
 variable "ssh_public_key" {
-  description = "Contents of the SSH public key allowed to log in as root, e.g. \"ssh-ed25519 AAAA... dan@mac\". Installed by cloud-init, not as a DigitalOcean account key."
+  description = "Contents of the SSH public key allowed to log in as root, e.g. \"ssh-ed25519 AAAA... dan@mac\". Registered as a DigitalOcean account key (so root gets no password) and installed by cloud-init."
   type        = string
 
   validation {
