@@ -93,10 +93,15 @@ variable "bot_github_token" {
 # Model
 # ---------------------------------------------------------------------------
 
+# DO names models differently from Anthropic (anthropic-claude-5-sonnet, not claude-sonnet-5),
+# so aliases like `sonnet` don't work there: use exact IDs from
+#   curl -s https://inference.do-ai.run/v1/models -H "Authorization: Bearer $KEY" | jq -r '.data[].id'
+# DO offers no Sonnet 5.5; Sonnet 5 is its newest Sonnet.
+
 variable "model" {
-  description = "Model passed to claude --model: an alias (sonnet, haiku, opus) or an exact ID from /v1/models."
+  description = "Exact DO model ID for the main work (claude --model). Also what the sonnet and opus aliases resolve to, so subagents asking for either stay on a model the key allows."
   type        = string
-  default     = "sonnet"
+  default     = "anthropic-claude-5-sonnet"
 
   validation {
     condition     = can(regex("^[A-Za-z0-9._-]+$", var.model))
@@ -105,13 +110,27 @@ variable "model" {
 }
 
 variable "small_fast_model" {
-  description = "Optional exact model ID for Claude Code's background/haiku model (ANTHROPIC_DEFAULT_HAIKU_MODEL). Empty leaves Claude Code's default."
+  description = "Exact DO model ID for Claude Code's background tasks and the haiku alias (ANTHROPIC_DEFAULT_HAIKU_MODEL)."
   type        = string
-  default     = ""
+  default     = "anthropic-claude-5.5-haiku"
 
   validation {
-    condition     = can(regex("^[A-Za-z0-9._-]*$", var.small_fast_model))
+    condition     = can(regex("^[A-Za-z0-9._-]+$", var.small_fast_model))
     error_message = "small_fast_model may only contain letters, digits, '.', '_' and '-'."
+  }
+}
+
+variable "model_overrides" {
+  description = "Claude Code modelOverrides: Anthropic model ID => DO model ID. Tells Claude Code which model each DO ID really is, so it uses the right context window and enables thinking/effort; IDs it doesn't recognise get a guessed window and an 'unrecognized model' warning. Keep in step with model and small_fast_model."
+  type        = map(string)
+  default = {
+    "claude-sonnet-5"  = "anthropic-claude-5-sonnet"
+    "claude-haiku-5-5" = "anthropic-claude-5.5-haiku"
+  }
+
+  validation {
+    condition     = alltrue([for k, v in var.model_overrides : can(regex("^claude-[a-z0-9-]+$", k)) && can(regex("^[A-Za-z0-9._-]+$", v))])
+    error_message = "model_overrides keys must be Anthropic model IDs (claude-...) and values DO model IDs."
   }
 }
 
