@@ -18,6 +18,7 @@ REPO_OWNER=${R%%/*}
 STATE_DIR=${STATE_DIRECTORY:-/var/lib/agent-ctl}
 CLONE=$STATE_DIR/repo.git
 JOBS=/srv/agent-work/jobs
+OUT_DIR=/srv/agent-work/out
 NEEDS_INFO=/srv/agent-work/scratch/NEEDS_INFO.md
 LOG_DIR=/var/log/agent
 PROMPTS=/opt/agent
@@ -112,7 +113,8 @@ new_job() {
 }
 
 # run_job <job-dir> <branch> <base-sha>. Sets JOB_RC, JOB_COMMITS, JOB_HEAD, JOB_IS_ERROR,
-# JOB_SUBTYPE, JOB_RESULT (Claude's final message) and JOB_NEEDS (clarification questions).
+# JOB_SUBTYPE, JOB_RESULT (Claude's final message), JOB_NEEDS (clarification questions) and
+# JOB_USAGE (per-model token usage JSON, see "Token usage").
 # Everything read back from the job dir was written by `agent`: treat it as untrusted data.
 run_job() {
   local job=$1 branch=$2 base=$3 id
@@ -130,12 +132,17 @@ run_job() {
     JOB_SUBTYPE=$(jq -r '.subtype // "unknown" | tostring' "$job/result.json")
     JOB_IS_ERROR=$(jq -r 'if .is_error == false then "false" else "true" end' "$job/result.json")
     JOB_RESULT=$(jq -r '.result // "" | tostring' "$job/result.json")
-    log "job $id: exit $JOB_RC $(jq -c '{subtype, is_error, num_turns, duration_ms, usage}' "$job/result.json")"
+    JOB_USAGE=$(jq -c "$USAGE_JQ usage_of" "$job/result.json" 2>/dev/null) || JOB_USAGE='{}'
+    log "job $id: exit $JOB_RC $(jq -c '{subtype, is_error, num_turns, duration_ms, modelUsage}' "$job/result.json")"
   else
-    JOB_SUBTYPE=no_output JOB_IS_ERROR=true JOB_RESULT=
+    JOB_SUBTYPE=no_output JOB_IS_ERROR=true JOB_RESULT= JOB_USAGE='{}'
     log "job $id: exit $JOB_RC, no JSON output (see $LOG_DIR/$id.log)"
   fi
   JOB_NEEDS=$(head -c "$MAX_BODY" "$job/needs-info.md")
+  # The usage section's markers are ours alone: model text carrying them could hijack the
+  # section on the next revision (whatever the target repo's CLAUDE.md tells the model).
+  JOB_RESULT=${JOB_RESULT//"$USAGE_START"/} JOB_RESULT=${JOB_RESULT//"$USAGE_END"/}
+  JOB_NEEDS=${JOB_NEEDS//"$USAGE_START"/} JOB_NEEDS=${JOB_NEEDS//"$USAGE_END"/}
 
   JOB_COMMITS=0 JOB_HEAD=$base
   if [[ -s $job/changes.bundle ]]; then
@@ -164,6 +171,106 @@ push() {
 }
 
 PUSH_HINT="The push was rejected. If the change touches .github/workflows, the bot's token can't push it (no workflow scope)."
+
+# ---------------------------------------------------------------------------------------------
+# Token usage
+# ---------------------------------------------------------------------------------------------
+# Usage JSON everywhere below is {"<model>": {input, output, cache_read, cache_write}}.
+# It comes from .modelUsage in result.json, not the top-level .usage, which leaves out
+# background models. No cost is shown: total_cost_usd uses Anthropic list prices, not DO's.
+
+USAGE_START='<!-- agent-usage:start -->'
+USAGE_END='<!-- agent-usage:end -->'
+
+# shellcheck disable=SC2016
+USAGE_JQ='
+  def tokens: if type == "number" and . >= 0 then floor else 0 end;
+  # result.json (written by `agent`, so untrusted) -> usage JSON.
+  def usage_of:
+    if type == "object" and (.modelUsage | type) == "object" then
+      reduce (.modelUsage | to_entries | .[:20][]) as $e ({};
+        ($e.key | tostring | gsub("[^A-Za-z0-9._-]"; "") | .[:64] | if . == "" then "unknown" else . end) as $m
+        | ($e.value | if type == "object" then . else {} end) as $v
+        | .[$m] = {
+            input: ((.[$m].input // 0) + ($v.inputTokens | tokens)),
+            output: ((.[$m].output // 0) + ($v.outputTokens | tokens)),
+            cache_read: ((.[$m].cache_read // 0) + ($v.cacheReadInputTokens | tokens)),
+            cache_write: ((.[$m].cache_write // 0) + ($v.cacheCreationInputTokens | tokens))})
+    else {} end;
+  def add_usage($a; $b):
+    reduce ($b | to_entries[]) as $e ($a;
+      .[$e.key] = ((.[$e.key] // {}) as $o | $e.value | with_entries(.value += ($o[.key] // 0))));
+  def commas: if . < 1000 then tostring else ((. / 1000 | floor) | commas) + "," + ("00" + (. % 1000 | tostring))[-3:] end;
+  def usage_row($label): "| \($label) | \(.input | commas) | \(.output | commas) | \(.cache_read | commas) | \(.cache_write | commas) |";
+  def usage_table:
+    if length == 0 then "_No usage reported._" else
+      ["| Model | Input | Output | Cache read | Cache write |", "|---|--:|--:|--:|--:|"]
+      + [to_entries | sort_by(.key)[] | .key as $k | .value | usage_row("`\($k)`")]
+      + (if length > 1 then [reduce .[] as $u ({input: 0, output: 0, cache_read: 0, cache_write: 0};
+          with_entries(.value += $u[.key])) | usage_row("**Total**")] else [] end)
+      | join("\n")
+    end;
+'
+
+# The PR body and every comment after a run are built here, never by the model, so the
+# usage is always added; the model's text is cut first so the usage always fits.
+USAGE_NOTE="_Counted by the poll script from Claude Code's result, not reported by the model._"
+
+# This run's usage as markdown, for comments.
+run_usage_md() {
+  printf '\n**Token usage, this run**\n\n'
+  jq -r "$USAGE_JQ usage_table" <<<"$JOB_USAGE"
+  printf '\n%s\n' "$USAGE_NOTE"
+}
+
+# comment_run <number>: message on stdin, then this run's token usage.
+comment_run() {
+  { head -c $((MAX_BODY - 8000)); printf '\n'; run_usage_md; } | comment "$1"
+}
+
+# issue_usage_add <issue>: add this run's usage to issue <issue>'s running total, save it,
+# and set ISSUE_USAGE to {runs, total, latest}. Totals are per issue, not per PR, so every
+# run counts, including failed ones before a PR exists. Branch agent/issue-N is 1:1 with
+# its PR, so a PR's total is its issue's.
+issue_usage_add() {
+  local f=$OUT_DIR/issue-$1-usage.json prev='{}'
+  if [[ -s $f ]]; then
+    prev=$(jq -c 'if type == "object" and (.total | type) == "object" then . else {} end' "$f" 2>/dev/null) || prev='{}'
+  fi
+  ISSUE_USAGE=$(jq -c --argjson run "$JOB_USAGE" \
+    "$USAGE_JQ"' {runs: ((.runs // 0) + 1), total: add_usage(.total // {}; $run), latest: $run}' <<<"$prev")
+  if ! { printf '%s\n' "$ISSUE_USAGE" >"$f.tmp" && mv -f "$f.tmp" "$f"; } 2>/dev/null; then
+    log "#$1: couldn't save token usage to $f"
+  fi
+}
+
+# The PR body's usage section (between markers, so revisions can replace it), from ISSUE_USAGE.
+pr_usage_section() {
+  printf '%s\n' "$USAGE_START"
+  jq -r "$USAGE_JQ"' "### Token usage\n\n" + (if .runs > 1
+      then "**Total, \(.runs) runs**\n\n\(.total | usage_table)\n\n**Latest run**\n\n\(.latest | usage_table)"
+      else .total | usage_table end)' <<<"$ISSUE_USAGE"
+  printf '\n%s\n%s\n' "$USAGE_NOTE" "$USAGE_END"
+}
+
+# pr_body_update_usage <pr> <scratch-prefix>: replace the usage section in PR <pr>'s body
+# (or insert it before `Closes #n`, or at the end) and PATCH the PR. Keeps any other edits.
+pr_body_update_usage() {
+  local n=$1 tmp=$2
+  # Called with errexit off (`|| log`), so stop by hand rather than PATCH a body we never read.
+  api "repos/$R/pulls/$n" -q '.body // ""' >"$tmp.old" || return 1
+  pr_usage_section >"$tmp.usage" || return 1
+  awk -v sec="$tmp.usage" -v s="$USAGE_START" -v e="$USAGE_END" -v marked="$(tr -d '\r' <"$tmp.old" | grep -c -x -F -- "$USAGE_START" || true)" '
+    function put(l) { while ((getline l < sec) > 0) print l; close(sec); done = 1 }
+    { line = $0; sub(/\r$/, "", line) }
+    skip { if (line == e) skip = 0; next }
+    !done && marked > 0 && line == s { put(); skip = 1; next }
+    !done && marked == 0 && line ~ /^Closes #[0-9]+$/ { put(); print "" }
+    { print }
+    END { if (!done) { print ""; put() } }
+  ' "$tmp.old" | head -c "$MAX_BODY" >"$tmp.new"
+  api -X PATCH "repos/$R/pulls/$n" -F body=@"$tmp.new" >/dev/null
+}
 
 # ---------------------------------------------------------------------------------------------
 # 0. Housekeeping
@@ -315,6 +422,11 @@ do_revise() {
   fi
   if job_failed || [[ $pushed == false ]]; then failed=true; fi
 
+  # Every run counts toward the PR's total, failed ones included.
+  issue_usage_add "$issue"
+  pr_body_update_usage "$n" "$job/pr-body" || pr_body_update_usage "$n" "$job/pr-body" ||
+    log "PR #$n: couldn't update the token usage in the PR body (the comment below still has this run's)"
+
   if [[ -n $JOB_NEEDS ]]; then
     body=$JOB_NEEDS
   elif [[ -n $JOB_RESULT ]]; then
@@ -329,7 +441,7 @@ do_revise() {
       ((JOB_COMMITS > 0)) && [[ $pushed == true ]] && printf 'Partial work (%s commit(s)) was pushed.\n\n' "$JOB_COMMITS"
     fi
     printf '%s\n' "$body"
-  } | comment "$n"
+  } | comment_run "$n"
 
   [[ $failed == true ]] && label_add "$n" agent:failed
   label_rm "$n" agent:working
@@ -405,34 +517,43 @@ do_issue() {
   } >"$job/prompt.md"
 
   run_job "$job" "$branch" "$base"
+  issue_usage_add "$n" # before any early return: failed runs count toward the issue's total
 
   label_rm "$n" agent:working
 
   if [[ -n $JOB_NEEDS ]] && ((JOB_COMMITS == 0)); then
-    printf 'I need some answers before I can start. Reply here, then re-add `agent`.\n\n%s\n' "$JOB_NEEDS" | comment "$n"
+    {
+      printf 'I need some answers before I can start. Reply here, then re-add `agent`.\n\n%s\n' "$JOB_NEEDS"
+    } | comment_run "$n"
     label_add "$n" agent:needs-info
     log "#$n: needs info"
     return
   fi
 
   if ((JOB_COMMITS == 0)); then
-    printf '**The agent made no commits** (`%s`, exit %s). Re-add `agent` to retry.\n\n%s\n' \
-      "$JOB_SUBTYPE" "$JOB_RC" "${JOB_RESULT:-(no summary)}" | comment "$n"
+    {
+      printf '**The agent made no commits** (`%s`, exit %s). Re-add `agent` to retry.\n\n%s\n' \
+        "$JOB_SUBTYPE" "$JOB_RC" "${JOB_RESULT:-(no summary)}"
+    } | comment_run "$n"
     label_add "$n" agent:failed
     log "#$n: failed, no commits"
     return
   fi
 
   if ! push "$JOB_HEAD" "$branch" --force; then
-    printf '**Pushing `%s` failed.** %s Re-add `agent` to retry.\n' "$branch" "$PUSH_HINT" | comment "$n"
+    {
+      printf '**Pushing `%s` failed.** %s Re-add `agent` to retry.\n' "$branch" "$PUSH_HINT"
+    } | comment_run "$n"
     label_add "$n" agent:failed
     log "#$n: push failed"
     return
   fi
 
   if job_failed; then
-    printf '**Partial work on branch `%s`, no PR** (`%s`, exit %s). Re-add `agent` to retry.\n\n%s\n' \
-      "$branch" "$JOB_SUBTYPE" "$JOB_RC" "${JOB_RESULT:-(no summary)}" | comment "$n"
+    {
+      printf '**Partial work on branch `%s`, no PR** (`%s`, exit %s). Re-add `agent` to retry.\n\n%s\n' \
+        "$branch" "$JOB_SUBTYPE" "$JOB_RC" "${JOB_RESULT:-(no summary)}"
+    } | comment_run "$n"
     label_add "$n" agent:failed
     log "#$n: failed, partial work pushed"
     return
@@ -445,8 +566,10 @@ do_issue() {
     footer="**Request changes** (inline comments welcome) and I'll revise; merge it yourself when happy. To ask for another pass without a review, add the \`agent\` label to this PR."
   fi
   {
-    printf '%s\n' "${JOB_RESULT:-(no summary)}" | head -c $((MAX_BODY - 2000))
-    printf '\n\nCloses #%s\n\n---\n\n_Opened by the Helix Reborn agent._ %s\n' "$n" "$footer"
+    printf '%s\n' "${JOB_RESULT:-(no summary)}" | head -c $((MAX_BODY - 6000))
+    printf '\n'
+    pr_usage_section
+    printf '\nCloses #%s\n\n---\n\n_Opened by the Helix Reborn agent._ %s\n' "$n" "$footer"
   } >"$body_file"
 
   existing=$(api "repos/$R/pulls?state=open&head=$REPO_OWNER:$branch" -q '.[0].number // empty')

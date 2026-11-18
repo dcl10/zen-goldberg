@@ -122,6 +122,11 @@ get `agent:blocked` and wait until the first PR merges.
 - Trigger a tick now: `systemctl start agent-poll` (as root on the box).
 - Per-job logs: `/var/log/agent/<job>.log` (wrapper output, stderr) and `<job>.json` (Claude's JSON result).
 - Hand-over dirs from recent jobs: `/srv/agent-work/jobs/` (kept two days).
+- Token usage: each PR body has a per-model table (input, output, cache read, cache write) with
+  the total over every run on its issue (failed runs before the PR included) and the latest run;
+  every bot comment after a run shows that run's usage. Running totals live in
+  `/srv/agent-work/out/issue-<n>-usage.json`, which a Droplet replacement wipes.
+  No dollar cost is shown: Claude Code's figure uses Anthropic list prices, not DO's.
 
 ## Changing settings
 

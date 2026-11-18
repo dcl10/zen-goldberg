@@ -68,6 +68,7 @@ install -d -m 0755 -o root -g root /srv/agent-work
 install -d -m 0750 -o agent -g agent /srv/agent-work/repo         # agent's work tree; agent-ctl never runs git here
 install -d -m 0700 -o agent -g agent /srv/agent-work/scratch      # NEEDS_INFO.md
 install -d -m 2750 -o agent-ctl -g agentwork /srv/agent-work/jobs # per-job hand-over dirs, created by agent-ctl
+install -d -m 0700 -o agent-ctl -g agent-ctl /srv/agent-work/out  # per-issue token usage totals; agent can't write here
 install -d -m 0750 -o agent-ctl -g agent-ctl /var/log/agent
 
 cat >/etc/profile.d/agent-umask.sh <<'EOF'
