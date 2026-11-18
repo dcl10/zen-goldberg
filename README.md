@@ -43,6 +43,7 @@ comments and reviews to the model. It never creates issues, edits issue bodies o
 | `agent:blocked` | Waiting on open `Blocked by` issues (native dependencies or `Blocked by #N` / `Depends on #N` in the body). |
 | `agent:needs-info` | The bot asked questions in a comment. Answer, then re-add `agent`. |
 | `agent:failed` | The run failed; see its comment. Re-add `agent` to retry. |
+| `agent:rate-limited` | The model provider refused the run for quota (HTTP 429). The bot runs no model jobs for an hour (`AGENT_RATE_LIMIT_BACKOFF` seconds), then retries this by itself. Remove the label to cancel. |
 
 ## Setup
 

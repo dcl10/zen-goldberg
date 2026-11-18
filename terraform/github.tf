@@ -1,11 +1,12 @@
 locals {
   agent_labels = {
-    "agent"            = { color = "1d76db", description = "Queue for the bot (only the repo owner adds this). On a bot PR: ask for another pass." }
-    "agent:working"    = { color = "fbca04", description = "The bot is working on this now." }
-    "agent:review"     = { color = "0e8a16", description = "The bot opened a PR for this; waiting for review." }
-    "agent:blocked"    = { color = "c5def5", description = "Waiting on open blocking issues." }
-    "agent:needs-info" = { color = "d876e3", description = "The bot asked questions; answer, then re-add agent." }
-    "agent:failed"     = { color = "b60205", description = "The bot's run failed; see its comment. Re-add agent to retry." }
+    "agent"              = { color = "1d76db", description = "Queue for the bot (only the repo owner adds this). On a bot PR: ask for another pass." }
+    "agent:working"      = { color = "fbca04", description = "The bot is working on this now." }
+    "agent:review"       = { color = "0e8a16", description = "The bot opened a PR for this; waiting for review." }
+    "agent:blocked"      = { color = "c5def5", description = "Waiting on open blocking issues." }
+    "agent:needs-info"   = { color = "d876e3", description = "The bot asked questions; answer, then re-add agent." }
+    "agent:failed"       = { color = "b60205", description = "The bot's run failed; see its comment. Re-add agent to retry." }
+    "agent:rate-limited" = { color = "f9d0c4", description = "The model provider rate-limited the run; the bot retries automatically. Remove to cancel." }
   }
 }
 
