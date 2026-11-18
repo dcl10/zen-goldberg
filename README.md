@@ -2,7 +2,8 @@
 
 Infrastructure for an unattended Claude Code bot that works on
 [Helix Reborn](https://github.com/dcl10/helix-reborn). It runs on a DigitalOcean Droplet and uses
-DigitalOcean serverless inference (Sonnet 5.5), not a Claude subscription.
+DigitalOcean serverless inference (Sonnet 5, with Haiku 5.5 for background tasks), not a Claude
+subscription.
 
 The flow:
 
@@ -48,8 +49,9 @@ comments and reviews to the model. It never creates issues, edits issue bodies o
 ### 1. Prerequisites
 
 - [ ] DigitalOcean: prepaid balance added, **auto-reload off** (caps what a leaked model key can spend).
-- [ ] DO model access key (Control panel → Agent Platform → Model access keys), ideally scoped to
-      Sonnet 5.5 + Haiku 5.5. Check it works and see the model IDs:
+- [ ] DO model access key (Control panel → Inference → Manage → Model Access Keys), scoped to
+      `anthropic-claude-5-sonnet` and `anthropic-claude-5.5-haiku` (DO has no Sonnet 5.5).
+      Check it works and see the model IDs:
       ```bash
       curl -s https://inference.do-ai.run/v1/models -H "Authorization: Bearer $KEY" | jq -r '.data[].id'
       ```
@@ -148,7 +150,7 @@ terraform destroy                            # everything
 
 `s-2vcpu-4gb` costs about $24/month if left on. The reserved IP is free while assigned, but DO
 bills a small hourly fee for it while the Droplet is gone; `terraform destroy` releases it. Model usage is billed separately from the prepaid
-balance (roughly $2 / $10 per million input / output tokens for Sonnet 5.5). The cost Claude Code
+balance (see DO's pricing page for Sonnet 5 and Haiku 5.5). The cost Claude Code
 reports may not match DO's billing.
 
 ## Layout

@@ -23,15 +23,20 @@ locals {
 
   claude_settings = jsonencode({
     apiKeyHelper = "cat /etc/agent/model-key"
-    env = merge(
-      {
-        ANTHROPIC_BASE_URL                       = "https://inference.do-ai.run"
-        CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS   = "1"
-        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
-        DISABLE_AUTOUPDATER                      = "1"
-      },
-      var.small_fast_model == "" ? {} : { ANTHROPIC_DEFAULT_HAIKU_MODEL = var.small_fast_model },
-    )
+    # Maps Anthropic IDs to DO's, so Claude Code knows what each DO ID is (context window,
+    # thinking, effort) instead of guessing.
+    modelOverrides = var.model_overrides
+    env = {
+      ANTHROPIC_BASE_URL                       = "https://inference.do-ai.run"
+      CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS   = "1"
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
+      DISABLE_AUTOUPDATER                      = "1"
+      # Every alias lands on a model the key allows. The key has no Opus, so opus goes to
+      # the main model too.
+      ANTHROPIC_DEFAULT_SONNET_MODEL = var.model
+      ANTHROPIC_DEFAULT_OPUS_MODEL   = var.model
+      ANTHROPIC_DEFAULT_HAIKU_MODEL  = var.small_fast_model
+    }
   })
 
   # gitconfig double-quoted values use the same escapes as JSON for ordinary text.
