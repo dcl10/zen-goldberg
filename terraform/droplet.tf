@@ -96,6 +96,13 @@ resource "digitalocean_tag" "agent" {
   name = "helix-agent"
 }
 
+# Registering the key with DigitalOcean (not just installing it via cloud-init) stops DO from
+# giving root an expired, emailed password that must be changed at first login.
+resource "digitalocean_ssh_key" "agent" {
+  name       = "helix-agent"
+  public_key = var.ssh_public_key
+}
+
 # Stateless: any change to user_data (scripts, secrets, settings) replaces the box.
 resource "digitalocean_droplet" "agent" {
   count = var.droplet_enabled ? 1 : 0
@@ -106,6 +113,7 @@ resource "digitalocean_droplet" "agent" {
   image      = var.droplet_image
   monitoring = true
   tags       = [digitalocean_tag.agent.id]
+  ssh_keys   = [digitalocean_ssh_key.agent.fingerprint]
   user_data  = local.user_data
 }
 
