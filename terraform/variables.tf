@@ -156,6 +156,39 @@ variable "job_timeout" {
   }
 }
 
+variable "model_max_retries" {
+  description = "Claude Code's retries per model request (CLAUDE_CODE_MAX_RETRIES; its default is 10). Kept low so a quota 429 ends the run quickly and the poll script requeues it, instead of the run crawling from retry to retry until job_timeout."
+  type        = number
+  default     = 3
+
+  validation {
+    condition     = var.model_max_retries >= 0 && var.model_max_retries <= 10 && var.model_max_retries == floor(var.model_max_retries)
+    error_message = "model_max_retries must be a whole number from 0 to 10."
+  }
+}
+
+variable "min_quota_tokens" {
+  description = "Don't start a model job unless the model key has at least this many tokens of DO's daily quota left (checked with a 1-token request); the issue or PR is labelled agent:rate-limited and retried later. One run uses ~2M (DO counts cache reads). 0 turns the check off."
+  type        = number
+  default     = 2000000
+
+  validation {
+    condition     = var.min_quota_tokens >= 0 && var.min_quota_tokens < 1000000000000 && var.min_quota_tokens == floor(var.min_quota_tokens)
+    error_message = "min_quota_tokens must be a whole number, 0 or more."
+  }
+}
+
+variable "rate_limit_backoff" {
+  description = "Seconds without model jobs after a run is rate-limited or stopped by the quota check. A retry that the quota check stops costs ~1 token, so this is how often to look, not how long to rest."
+  type        = number
+  default     = 3600
+
+  validation {
+    condition     = var.rate_limit_backoff >= 60 && var.rate_limit_backoff == floor(var.rate_limit_backoff)
+    error_message = "rate_limit_backoff must be a whole number of seconds, 60 or more."
+  }
+}
+
 variable "poll_interval" {
   description = "Gap between poll runs (systemd time span, e.g. 3min)."
   type        = string

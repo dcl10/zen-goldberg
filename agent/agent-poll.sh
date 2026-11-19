@@ -11,7 +11,7 @@ shopt -s inherit_errexit
 umask 0027
 
 : "${AGENT_REPO:?}" "${AGENT_DEFAULT_BRANCH:?}" "${AGENT_OWNER:?}" "${AGENT_BOT:?}" "${AGENT_MODEL:?}"
-: "${AGENT_MAX_TURNS:?}" "${AGENT_JOB_TIMEOUT:?}" "${AGENT_AUTO_MERGE:?}" "${GH_TOKEN:?}"
+: "${AGENT_MAX_TURNS:?}" "${AGENT_JOB_TIMEOUT:?}" "${AGENT_AUTO_MERGE:?}" "${AGENT_MIN_QUOTA_TOKENS:?}" "${GH_TOKEN:?}"
 
 R=$AGENT_REPO
 REPO_OWNER=${R%%/*}
@@ -28,6 +28,12 @@ MAX_BODY=60000
 # epoch time; the issue or PR gets agent:rate-limited and is retried then.
 RATE_LIMIT_FILE=$STATE_DIR/rate-limited-until
 RATE_LIMIT_BACKOFF=${AGENT_RATE_LIMIT_BACKOFF:-3600}
+# run-claude.sh's exit code when its pre-flight check finds too little daily quota left.
+QUOTA_LOW_EXIT=75
+# Anthropic model ID => DO model ID (Terraform's model_overrides). Claude Code's per-message
+# events name the Anthropic ID, its final result the DO ID; usage is keyed by the DO ID.
+MODEL_IDS=${AGENT_MODEL_IDS:-'{}'}
+jq -e 'type == "object" and all(.[]; type == "string")' <<<"$MODEL_IDS" >/dev/null 2>&1 || MODEL_IDS='{}'
 # Marks the bot's rate-limit comments, which aren't "activity" for [NEW] feedback on a PR.
 RATE_LIMIT_MARK='<!-- agent:rate-limited -->'
 
@@ -112,44 +118,73 @@ new_job() {
   git -C "$CLONE" bundle create -q "$job/base.bundle" refs/jobs/base
   chmod 0640 "$job/base.bundle"
   local f
-  for f in result.json needs-info.md changes.bundle; do
+  for f in events.jsonl needs-info.md changes.bundle; do
     : >"$job/$f"
     chmod 0660 "$job/$f"
   done
   printf '%s\n' "$job"
 }
 
-# run_job <job-dir> <branch> <base-sha>. Sets JOB_RC, JOB_COMMITS, JOB_HEAD, JOB_IS_ERROR,
-# JOB_SUBTYPE, JOB_RESULT (Claude's final message), JOB_NEEDS (clarification questions) and
-# JOB_USAGE (per-model token usage JSON, see "Token usage").
+# run_job <job-dir> <branch> <base-sha>. Sets:
+#   JOB_RC, JOB_TIMED_OUT, JOB_QUOTA_LOW (+ JOB_QUOTA_LEFT): how run-claude.sh ended
+#   JOB_SUBTYPE, JOB_IS_ERROR, JOB_RESULT: from Claude's final result event; without one,
+#     JOB_SUBTYPE is timeout, quota_low or no_result and JOB_RESULT is empty
+#   JOB_LAST_TEXT: Claude's last text message, for runs that ended without a result
+#   JOB_RETRIES, JOB_RL_RETRIES, JOB_STUCK_429: API retries, those for 429s, and whether
+#     the run was killed while retrying a 429
+#   JOB_USAGE, JOB_USAGE_PARTIAL: per-model token usage (see "Token usage"); partial when it
+#     had to be added up from the events because the run never finished
+#   JOB_NEEDS, JOB_COMMITS, JOB_HEAD: clarification questions and returned commits
 # Everything read back from the job dir was written by `agent`: treat it as untrusted data.
 run_job() {
-  local job=$1 branch=$2 base=$3 id
+  local job=$1 branch=$2 base=$3 id summary
   id=$(basename "$job")
   chmod 0640 "$job/prompt.md"
   log "job $id: $AGENT_MODEL on $branch from ${base:0:12}"
 
   JOB_RC=0
   timeout --kill-after=2m "$AGENT_JOB_TIMEOUT" \
-    sudo -n -u agent /opt/agent/run-claude.sh "$job" "$AGENT_MODEL" "$AGENT_MAX_TURNS" "$branch" \
+    sudo -n -u agent /opt/agent/run-claude.sh "$job" "$AGENT_MODEL" "$AGENT_MAX_TURNS" "$branch" "$AGENT_MIN_QUOTA_TOKENS" \
     >"$LOG_DIR/$id.log" 2>&1 || JOB_RC=$?
 
-  cp "$job/result.json" "$LOG_DIR/$id.json"
-  if jq -e 'type == "object"' "$job/result.json" >/dev/null 2>&1; then
-    JOB_SUBTYPE=$(jq -r '.subtype // "unknown" | tostring' "$job/result.json")
-    JOB_IS_ERROR=$(jq -r 'if .is_error == false then "false" else "true" end' "$job/result.json")
-    JOB_RESULT=$(jq -r '.result // "" | tostring' "$job/result.json")
-    JOB_USAGE=$(jq -c "$USAGE_JQ usage_of" "$job/result.json" 2>/dev/null) || JOB_USAGE='{}'
-    log "job $id: exit $JOB_RC $(jq -c '{subtype, is_error, num_turns, duration_ms, modelUsage}' "$job/result.json")"
-  else
-    JOB_SUBTYPE=no_output JOB_IS_ERROR=true JOB_RESULT= JOB_USAGE='{}'
-    log "job $id: exit $JOB_RC, no JSON output (see $LOG_DIR/$id.log)"
+  JOB_TIMED_OUT=false JOB_QUOTA_LOW=false JOB_QUOTA_LEFT=
+  [[ $JOB_RC -eq 124 || $JOB_RC -eq 137 ]] && JOB_TIMED_OUT=true
+  if [[ $JOB_RC -eq $QUOTA_LOW_EXIT ]]; then
+    JOB_QUOTA_LOW=true
+    JOB_QUOTA_LEFT=$(sed -n 's/^run-claude: quota \([0-9]\{1,12\}\) tokens left.*/\1/p' "$LOG_DIR/$id.log" | tail -n 1)
   fi
+
+  cp "$job/events.jsonl" "$LOG_DIR/$id.jsonl"
+  summary=$(head -c 268435456 "$job/events.jsonl" | jq -n -R -c --argjson ids "$MODEL_IDS" "$USAGE_JQ run_summary(\$ids)" 2>/dev/null) ||
+    summary='{}'
+  jq -e 'type == "object"' <<<"$summary" >/dev/null 2>&1 || summary='{}'
+  log "job $id: exit $JOB_RC $(jq -c '{final, subtype, is_error, num_turns, duration_ms, retries, rate_limit_retries, usage}' <<<"$summary")"
+
+  if [[ $(jq -r '.final == true' <<<"$summary") == true ]]; then
+    JOB_SUBTYPE=$(jq -r '.subtype // "unknown" | tostring' <<<"$summary")
+    JOB_IS_ERROR=$(jq -r 'if .is_error == false then "false" else "true" end' <<<"$summary")
+    JOB_RESULT=$(jq -r '.result // "" | tostring' <<<"$summary")
+    JOB_USAGE_PARTIAL=false
+  else
+    if [[ $JOB_TIMED_OUT == true ]]; then JOB_SUBTYPE=timeout
+    elif [[ $JOB_QUOTA_LOW == true ]]; then JOB_SUBTYPE=quota_low
+    else JOB_SUBTYPE=no_result; fi
+    JOB_IS_ERROR=true JOB_RESULT= JOB_USAGE_PARTIAL=true
+    [[ $JOB_QUOTA_LOW == true ]] && JOB_USAGE_PARTIAL=false
+    log "job $id: no result event (see $LOG_DIR/$id.log and $id.jsonl)"
+  fi
+  JOB_USAGE=$(jq -c '.usage // {}' <<<"$summary")
+  JOB_LAST_TEXT=$(jq -r '.last_text // "" | tostring' <<<"$summary")
+  JOB_RETRIES=$(jq -r '.retries // 0' <<<"$summary")
+  JOB_RL_RETRIES=$(jq -r '.rate_limit_retries // 0' <<<"$summary")
+  JOB_STUCK_429=$(jq -r '.stuck_on_429 == true' <<<"$summary")
+
   JOB_NEEDS=$(head -c "$MAX_BODY" "$job/needs-info.md")
   # The usage section's markers are ours alone: model text carrying them could hijack the
   # section on the next revision (whatever the target repo's CLAUDE.md tells the model).
   JOB_RESULT=${JOB_RESULT//"$USAGE_START"/} JOB_RESULT=${JOB_RESULT//"$USAGE_END"/}
   JOB_NEEDS=${JOB_NEEDS//"$USAGE_START"/} JOB_NEEDS=${JOB_NEEDS//"$USAGE_END"/}
+  JOB_LAST_TEXT=${JOB_LAST_TEXT//"$USAGE_START"/} JOB_LAST_TEXT=${JOB_LAST_TEXT//"$USAGE_END"/}
 
   JOB_COMMITS=0 JOB_HEAD=$base
   if [[ -s $job/changes.bundle ]]; then
@@ -172,11 +207,40 @@ run_job() {
 
 job_failed() { [[ $JOB_RC -ne 0 || $JOB_IS_ERROR == true ]]; }
 
-# The provider refused the run for quota. Claude Code then ends with a result like
-# "API Error: Request rejected (429) · Rate limit exceeded: tokens_per_day."
+# The run never started or stopped for quota: the pre-flight check found too little left; or
+# Claude Code ran out of retries on a 429 and ended with a result like "API Error: Request
+# rejected (429) · Rate limit exceeded: tokens_per_day."; or the job timeout killed it while
+# it was still retrying a 429.
 job_rate_limited() {
   local first=${JOB_RESULT%%$'\n'*}
-  job_failed && [[ $first == "API Error:"* && $first =~ (\(429\)|[Rr]ate\ limit) ]]
+  [[ $JOB_QUOTA_LOW == true ]] && return 0
+  job_failed || return 1
+  [[ $first == "API Error:"* && $first =~ (\(429\)|[Rr]ate\ limit) ]] || [[ $JOB_STUCK_429 == true ]]
+}
+
+# How a failed run ended, for comments: "timed out after 45m" or "`subtype`, exit N", plus
+# its API retries.
+job_how() {
+  if [[ $JOB_TIMED_OUT == true ]]; then
+    printf 'timed out after %s' "$AGENT_JOB_TIMEOUT"
+  else
+    printf '`%s`, exit %s' "$JOB_SUBTYPE" "$JOB_RC"
+  fi
+  if ((JOB_RETRIES > 0)); then
+    printf '; %s API retries, %s of them for rate limits' "$JOB_RETRIES" "$JOB_RL_RETRIES"
+  fi
+}
+
+# What the run said: its final summary, or else its last message before it stopped.
+job_summary_md() {
+  if [[ -n $JOB_RESULT ]]; then
+    printf '%s\n' "$JOB_RESULT"
+  elif [[ -n $JOB_LAST_TEXT ]]; then
+    printf 'It stopped before writing a summary. Its last message:\n\n'
+    sed 's/^/> /' <<<"$JOB_LAST_TEXT"
+  else
+    printf '(no summary)\n'
+  fi
 }
 
 # True while a rate-limit pause is running.
@@ -198,10 +262,17 @@ rate_limit_requeue() {
   log "#$n: rate limited; no model jobs until $when"
   [[ $already == true ]] && return
   {
-    printf '%s\n**The model provider rate-limited this run.** I'\''ll retry after %s, ' "$RATE_LIMIT_MARK" "$when"
-    printf 'and every %s minutes after that until it gets through. Remove `agent:rate-limited` to cancel.\n\n' \
-      "$((RATE_LIMIT_BACKOFF / 60))"
-    printf '%s\n' "$JOB_RESULT"
+    printf '%s\n' "$RATE_LIMIT_MARK"
+    if [[ $JOB_QUOTA_LOW == true ]]; then
+      printf '**Not started: too little model quota left today** (%s tokens; a run needs about %s). ' \
+        "$(jq -rn "$USAGE_JQ ${JOB_QUOTA_LEFT:-0} | commas")" "$(jq -rn "$USAGE_JQ $AGENT_MIN_QUOTA_TOKENS | commas")"
+    else
+      printf '**The model provider rate-limited this run** (%s). ' "$(job_how)"
+    fi
+    printf 'I'\''ll retry after %s, and every %s minutes after that until it gets through. ' \
+      "$when" "$((RATE_LIMIT_BACKOFF / 60))"
+    printf 'Remove `agent:rate-limited` to cancel.\n\n'
+    [[ $JOB_QUOTA_LOW == true ]] || job_summary_md
   } | comment_run "$n"
 }
 
@@ -216,8 +287,11 @@ PUSH_HINT="The push was rejected. If the change touches .github/workflows, the b
 # Token usage
 # ---------------------------------------------------------------------------------------------
 # Usage JSON everywhere below is {"<model>": {input, output, cache_read, cache_write}}.
-# It comes from .modelUsage in result.json, not the top-level .usage, which leaves out
-# background models. No cost is shown: total_cost_usd uses Anthropic list prices, not DO's.
+# It comes from .modelUsage in Claude's final result event, not the top-level .usage, which
+# leaves out background models. A run killed before its result (job timeout) has no
+# .modelUsage, so its usage is added up from the per-message usage in its assistant events
+# instead; that misses Claude Code's background calls, so it's marked partial.
+# No cost is shown: total_cost_usd uses Anthropic list prices, not DO's.
 
 USAGE_START='<!-- agent-usage:start -->'
 USAGE_END='<!-- agent-usage:end -->'
@@ -225,18 +299,59 @@ USAGE_END='<!-- agent-usage:end -->'
 # shellcheck disable=SC2016
 USAGE_JQ='
   def tokens: if type == "number" and . >= 0 then floor else 0 end;
-  # result.json (written by `agent`, so untrusted) -> usage JSON.
+  def model_key: tostring | gsub("[^A-Za-z0-9._-]"; "") | .[:64] | if . == "" then "unknown" else . end;
+  # Add token counts $t ({input, output, cache_read, cache_write}) to model $m.
+  def add_tokens($m; $t):
+    .[$m] = ((.[$m] // {}) as $o | {
+      input: (($o.input // 0) + $t.input),
+      output: (($o.output // 0) + $t.output),
+      cache_read: (($o.cache_read // 0) + $t.cache_read),
+      cache_write: (($o.cache_write // 0) + $t.cache_write)});
+  # Claude Code'"'"'s final result event (written by `agent`, so untrusted) -> usage JSON.
   def usage_of:
     if type == "object" and (.modelUsage | type) == "object" then
       reduce (.modelUsage | to_entries | .[:20][]) as $e ({};
-        ($e.key | tostring | gsub("[^A-Za-z0-9._-]"; "") | .[:64] | if . == "" then "unknown" else . end) as $m
-        | ($e.value | if type == "object" then . else {} end) as $v
-        | .[$m] = {
-            input: ((.[$m].input // 0) + ($v.inputTokens | tokens)),
-            output: ((.[$m].output // 0) + ($v.outputTokens | tokens)),
-            cache_read: ((.[$m].cache_read // 0) + ($v.cacheReadInputTokens | tokens)),
-            cache_write: ((.[$m].cache_write // 0) + ($v.cacheCreationInputTokens | tokens))})
+        ($e.value | if type == "object" then . else {} end) as $v
+        | add_tokens($e.key | model_key; {
+            input: ($v.inputTokens | tokens), output: ($v.outputTokens | tokens),
+            cache_read: ($v.cacheReadInputTokens | tokens), cache_write: ($v.cacheCreationInputTokens | tokens)}))
     else {} end;
+  # Array of events -> usage JSON from the assistant messages. One API response can appear as
+  # several events (one per content block) with the same id and usage, so keep one per id.
+  # $ids maps Anthropic model IDs to DO ones.
+  def stream_usage($ids):
+    reduce (.[] | select(.type == "assistant") | .message | objects | select(.id != null)) as $m
+      ({}; .[$m.id | tostring] = $m)
+    | reduce (.[]) as $m ({};
+        ($m.model | tostring | ($ids[.] // .) | model_key) as $k
+        | ($m.usage | if type == "object" then . else {} end) as $u
+        | add_tokens($k; {
+            input: ($u.input_tokens | tokens), output: ($u.output_tokens | tokens),
+            cache_read: ($u.cache_read_input_tokens | tokens), cache_write: ($u.cache_creation_input_tokens | tokens)}))
+    | to_entries | .[:20] | from_entries;
+  # stream-json lines on stdin (jq -n -R) -> what run_job needs from them. Unparsable lines (a
+  # run killed mid-write) are skipped.
+  def run_summary($ids):
+    [inputs | fromjson? | objects] as $ev
+    | ($ev | map(select(.type == "result")) | last) as $r
+    | ($ev | map(select(.type == "system" and .subtype == "api_retry"))) as $retries
+    | ([$ev | to_entries[] | select(.value.type == "assistant") | .key] | last // -1) as $last_assistant
+    | ([$ev | to_entries[] | select(.value.type == "system" and .value.subtype == "api_retry"
+          and .value.error_status == 429) | .key] | last // -1) as $last_429
+    | {
+        final: ($r != null),
+        subtype: $r.subtype,
+        is_error: $r.is_error,
+        result: $r.result,
+        num_turns: $r.num_turns,
+        duration_ms: $r.duration_ms,
+        retries: ($retries | length),
+        rate_limit_retries: ($retries | map(select(.error_status == 429)) | length),
+        stuck_on_429: ($r == null and $last_429 > $last_assistant),
+        last_text: ([$ev[] | select(.type == "assistant") | .message.content? | arrays | .[]
+          | objects | select(.type == "text") | .text | strings] | last // "" | .[:4000]),
+        usage: (if $r != null then ($r | usage_of) else ($ev | stream_usage($ids)) end)
+      };
   def add_usage($a; $b):
     reduce ($b | to_entries[]) as $e ($a;
       .[$e.key] = ((.[$e.key] // {}) as $o | $e.value | with_entries(.value += ($o[.key] // 0))));
@@ -256,11 +371,21 @@ USAGE_JQ='
 # usage is always added; the model's text is cut first so the usage always fits.
 USAGE_NOTE="_Counted by the poll script from Claude Code's result, not reported by the model._"
 
+USAGE_PARTIAL_NOTE="_Counted by the poll script from Claude Code's events up to where the run stopped, not reported by the model. Its background calls (\`haiku\`) aren't in them, so the real usage is a little higher._"
+
 # This run's usage as markdown, for comments.
 run_usage_md() {
+  if [[ $JOB_QUOTA_LOW == true ]]; then
+    printf '\n_No model tokens used: the run didn'\''t start._\n'
+    return
+  fi
   printf '\n**Token usage, this run**\n\n'
   jq -r "$USAGE_JQ usage_table" <<<"$JOB_USAGE"
-  printf '\n%s\n' "$USAGE_NOTE"
+  if [[ $JOB_USAGE_PARTIAL == true ]]; then
+    printf '\n%s\n' "$USAGE_PARTIAL_NOTE"
+  else
+    printf '\n%s\n' "$USAGE_NOTE"
+  fi
 }
 
 # comment_run <number>: message on stdin, then this run's token usage.
@@ -472,10 +597,13 @@ do_revise() {
   fi
   if job_failed || [[ $pushed == false ]]; then failed=true; fi
 
-  # Every run counts toward the PR's total, failed ones included.
-  issue_usage_add "$issue"
-  pr_body_update_usage "$n" "$job/pr-body" || pr_body_update_usage "$n" "$job/pr-body" ||
-    log "PR #$n: couldn't update the token usage in the PR body (the comment below still has this run's)"
+  # Every run counts toward the PR's total, failed ones included; one the pre-flight check
+  # stopped never started.
+  if [[ $JOB_QUOTA_LOW == false ]]; then
+    issue_usage_add "$issue"
+    pr_body_update_usage "$n" "$job/pr-body" || pr_body_update_usage "$n" "$job/pr-body" ||
+      log "PR #$n: couldn't update the token usage in the PR body (the comment below still has this run's)"
+  fi
 
   # Any partial commits are already pushed, so the retry carries on from them.
   if job_rate_limited && [[ $pushed == true ]]; then
@@ -486,14 +614,12 @@ do_revise() {
 
   if [[ -n $JOB_NEEDS ]]; then
     body=$JOB_NEEDS
-  elif [[ -n $JOB_RESULT ]]; then
-    body=$JOB_RESULT
   else
-    body="(The run ended without a summary.)"
+    body=$(job_summary_md)
   fi
   {
     if [[ $failed == true ]]; then
-      printf '**This revision run failed** (`%s`, exit %s). Re-add `agent` to retry.\n\n' "$JOB_SUBTYPE" "$JOB_RC"
+      printf '**This revision run failed** (%s). Re-add `agent` to retry.\n\n' "$(job_how)"
       [[ $pushed == false ]] && printf '%s\n\n' "$PUSH_HINT"
       ((JOB_COMMITS > 0)) && [[ $pushed == true ]] && printf 'Partial work (%s commit(s)) was pushed.\n\n' "$JOB_COMMITS"
     fi
@@ -583,12 +709,16 @@ do_issue() {
   } >"$job/prompt.md"
 
   run_job "$job" "$branch" "$base"
-  issue_usage_add "$n" # before any early return: failed runs count toward the issue's total
+  # Before any early return: failed runs count toward the issue's total. A run the pre-flight
+  # check stopped never started, so it doesn't.
+  [[ $JOB_QUOTA_LOW == true ]] || issue_usage_add "$n"
 
   label_rm "$n" agent:working
 
-  # Partial commits aren't pushed: the retry starts again from the default branch.
-  if job_rate_limited; then
+  # Partial commits aren't pushed: the retry starts again from the default branch. Except when
+  # the job timeout killed it mid-retry with commits made: those go down the partial-work path
+  # below, so the work isn't thrown away.
+  if job_rate_limited && [[ $JOB_STUCK_429 == false || $JOB_COMMITS -eq 0 ]]; then
     rate_limit_requeue "$n" "$was_limited"
     return
   fi
@@ -604,8 +734,8 @@ do_issue() {
 
   if ((JOB_COMMITS == 0)); then
     {
-      printf '**The agent made no commits** (`%s`, exit %s). Re-add `agent` to retry.\n\n%s\n' \
-        "$JOB_SUBTYPE" "$JOB_RC" "${JOB_RESULT:-(no summary)}"
+      printf '**The agent made no commits** (%s). Re-add `agent` to retry.\n\n' "$(job_how)"
+      job_summary_md
     } | comment_run "$n"
     label_add "$n" agent:failed
     log "#$n: failed, no commits"
@@ -623,8 +753,10 @@ do_issue() {
 
   if job_failed; then
     {
-      printf '**Partial work on branch `%s`, no PR** (`%s`, exit %s). Re-add `agent` to retry.\n\n%s\n' \
-        "$branch" "$JOB_SUBTYPE" "$JOB_RC" "${JOB_RESULT:-(no summary)}"
+      printf '**Partial work on branch `%s`, no PR** (%s). ' "$branch" "$(job_how)"
+      printf 'Re-adding `agent` starts again from `%s` and replaces this branch; ' "$AGENT_DEFAULT_BRANCH"
+      printf 'if the work looks done, open a PR from it yourself.\n\n'
+      job_summary_md
     } | comment_run "$n"
     label_add "$n" agent:failed
     log "#$n: failed, partial work pushed"
