@@ -682,10 +682,11 @@ pick_issue() {
 }
 
 do_issue() {
-  local issue=$1 n title branch base job comments was_limited=false
+  local issue=$1 n title branch base main_sha job comments was_limited=false resume_file resume_sha=
   n=$(jq -r .number <<<"$issue")
   title=$(jq -r .title <<<"$issue")
   branch=agent/issue-$n
+  resume_file=$STATE_DIR/issue-$n-resume
   has_label "$issue" agent:rate-limited && was_limited=true
   log "#$n: starting ($title)"
 
@@ -695,13 +696,31 @@ do_issue() {
   label_rm "$n" agent:rate-limited
   label_add "$n" agent:working
 
-  base=$(git -C "$CLONE" rev-parse "refs/remotes/origin/$AGENT_DEFAULT_BRANCH")
+  # A rate-limit retry carries on from the partial work the cut-short attempt pushed, if the
+  # branch still points at it. Any other start (the owner adding `agent`) begins again from
+  # the default branch.
+  if [[ $was_limited == true && -s $resume_file ]]; then
+    resume_sha=$(<"$resume_file")
+    [[ $(git -C "$CLONE" rev-parse -q --verify "refs/remotes/origin/$branch" || true) == "$resume_sha" ]] || resume_sha=
+  fi
+  rm -f "$resume_file"
+
+  main_sha=$(git -C "$CLONE" rev-parse "refs/remotes/origin/$AGENT_DEFAULT_BRANCH")
+  base=${resume_sha:-$main_sha}
   job=$(new_job "issue-$n" "$base")
   comments=$(owner_comments_md "$n")
 
   {
     printf '# Issue #%s: %s\n\n' "$n" "$title"
-    printf 'You are on a fresh branch `%s`, made from `%s`.\n\n## Issue body\n\n' "$branch" "$AGENT_DEFAULT_BRANCH"
+    if [[ -n $resume_sha ]]; then
+      printf 'You are on branch `%s`, which already holds partial work on this issue from an earlier ' "$branch"
+      printf 'attempt that the model rate limit cut short. Its commits since `%s` (%s):\n\n' "$AGENT_DEFAULT_BRANCH" "${main_sha:0:12}"
+      git -C "$CLONE" log -n 50 --oneline --no-decorate "$main_sha..$resume_sha" | sed 's/^/    /'
+      printf '\nCheck what is already done (`git diff %s..HEAD --stat`, then the parts you need) ' "${main_sha:0:12}"
+      printf 'and carry on from there; don'\''t redo finished work. Uncommitted work from that attempt is lost.\n\n## Issue body\n\n'
+    else
+      printf 'You are on a fresh branch `%s`, made from `%s`.\n\n## Issue body\n\n' "$branch" "$AGENT_DEFAULT_BRANCH"
+    fi
     jq -r '.body // "(no body)"' <<<"$issue"
     if [[ -n $comments ]]; then printf '\n\n## Comments from @%s (oldest first)\n\n%s\n' "$AGENT_OWNER" "$comments"; fi
     printf '\n\n## Clarification file\n\nIf the issue is too ambiguous to implement, write your questions to `%s` and make no commits.\n\n---\n\n' "$NEEDS_INFO"
@@ -715,10 +734,20 @@ do_issue() {
 
   label_rm "$n" agent:working
 
-  # Partial commits aren't pushed: the retry starts again from the default branch. Except when
-  # the job timeout killed it mid-retry with commits made: those go down the partial-work path
-  # below, so the work isn't thrown away.
-  if job_rate_limited && [[ $JOB_STUCK_429 == false || $JOB_COMMITS -eq 0 ]]; then
+  # Rate limited: push any partial commits and note where they reached, so the retry carries
+  # on from them instead of redoing the work from the default branch.
+  if job_rate_limited; then
+    if ((JOB_COMMITS > 0)); then
+      if push "$JOB_HEAD" "$branch" --force; then
+        printf '%s\n' "$JOB_HEAD" >"$resume_file"
+        log "#$n: partial work pushed to $branch; the retry carries on from it"
+      else
+        log "#$n: pushing partial work failed; the retry starts from ${resume_sha:-the default branch}"
+        [[ -z $resume_sha ]] || printf '%s\n' "$resume_sha" >"$resume_file"
+      fi
+    elif [[ -n $resume_sha ]]; then
+      printf '%s\n' "$resume_sha" >"$resume_file"
+    fi
     rate_limit_requeue "$n" "$was_limited"
     return
   fi
@@ -732,7 +761,9 @@ do_issue() {
     return
   fi
 
-  if ((JOB_COMMITS == 0)); then
+  # A resumed run adds nothing new when the cut-short attempt had already finished the work;
+  # the branch's earlier commits still go on to the push and PR below.
+  if ((JOB_COMMITS == 0)) && [[ -z $resume_sha ]]; then
     {
       printf '**The agent made no commits** (%s). Re-add `agent` to retry.\n\n' "$(job_how)"
       job_summary_md
