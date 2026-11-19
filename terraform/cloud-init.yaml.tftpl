@@ -41,7 +41,7 @@ packages:
 write_files:
 %{ for f in files ~}
   - path: ${f.path}
-    encoding: b64
+    encoding: gz+b64
     content: ${f.content}
     owner: ${f.owner}
     permissions: '${f.permissions}'
