@@ -56,23 +56,24 @@ locals {
   EOT
 
   # Files cloud-init writes. `defer` delays a file until after the users exist (needed for
-  # any owner other than root). Content is base64 so YAML quoting can never break it.
+  # any owner other than root). Content is base64 so YAML quoting can never break it, and
+  # gzipped first to keep user_data under DO's 64 KB limit.
   files = [
-    { path = "/opt/agent/bootstrap.sh", content = filebase64("${local.agent_dir}/bootstrap.sh"), owner = "root:root", permissions = "0700", defer = false },
-    { path = "/opt/agent/agent-poll.sh", content = filebase64("${local.agent_dir}/agent-poll.sh"), owner = "root:root", permissions = "0755", defer = false },
-    { path = "/opt/agent/run-claude.sh", content = filebase64("${local.agent_dir}/run-claude.sh"), owner = "root:root", permissions = "0755", defer = false },
-    { path = "/opt/agent/prompt-issue.md", content = filebase64("${local.agent_dir}/prompt-issue.md"), owner = "root:root", permissions = "0644", defer = false },
-    { path = "/opt/agent/prompt-revise.md", content = filebase64("${local.agent_dir}/prompt-revise.md"), owner = "root:root", permissions = "0644", defer = false },
-    { path = "/etc/systemd/system/agent-poll.service", content = filebase64("${local.agent_dir}/agent-poll.service"), owner = "root:root", permissions = "0644", defer = false },
-    { path = "/etc/systemd/system/agent-firewall.service", content = filebase64("${local.agent_dir}/agent-firewall.service"), owner = "root:root", permissions = "0644", defer = false },
-    { path = "/etc/systemd/system/agent-poll.timer", content = base64encode(templatefile("${local.agent_dir}/agent-poll.timer.tftpl", { poll_interval = var.poll_interval })), owner = "root:root", permissions = "0644", defer = false },
-    { path = "/etc/sudoers.d/agent-ctl", content = base64encode("agent-ctl ALL=(agent) NOPASSWD: /opt/agent/run-claude.sh\n"), owner = "root:root", permissions = "0440", defer = false },
-    { path = "/etc/agent/bootstrap.env", content = base64encode(local.bootstrap_env), owner = "root:root", permissions = "0600", defer = false },
-    { path = "/etc/agent/agent.env", content = base64encode(local.agent_env), owner = "agent-ctl:agent-ctl", permissions = "0600", defer = true },
-    { path = "/etc/agent/model-key", content = base64encode(var.do_model_access_key), owner = "agent:agent", permissions = "0600", defer = true },
-    { path = "/home/agent/.claude/settings.json", content = base64encode(local.claude_settings), owner = "agent:agent", permissions = "0644", defer = true },
-    { path = "/home/agent/.gitconfig", content = base64encode(local.bot_gitconfig), owner = "agent:agent", permissions = "0644", defer = true },
-    { path = "/home/agent-ctl/.gitconfig", content = base64encode(local.bot_gitconfig), owner = "agent-ctl:agent-ctl", permissions = "0644", defer = true },
+    { path = "/opt/agent/bootstrap.sh", content = base64gzip(file("${local.agent_dir}/bootstrap.sh")), owner = "root:root", permissions = "0700", defer = false },
+    { path = "/opt/agent/agent-poll.sh", content = base64gzip(file("${local.agent_dir}/agent-poll.sh")), owner = "root:root", permissions = "0755", defer = false },
+    { path = "/opt/agent/run-claude.sh", content = base64gzip(file("${local.agent_dir}/run-claude.sh")), owner = "root:root", permissions = "0755", defer = false },
+    { path = "/opt/agent/prompt-issue.md", content = base64gzip(file("${local.agent_dir}/prompt-issue.md")), owner = "root:root", permissions = "0644", defer = false },
+    { path = "/opt/agent/prompt-revise.md", content = base64gzip(file("${local.agent_dir}/prompt-revise.md")), owner = "root:root", permissions = "0644", defer = false },
+    { path = "/etc/systemd/system/agent-poll.service", content = base64gzip(file("${local.agent_dir}/agent-poll.service")), owner = "root:root", permissions = "0644", defer = false },
+    { path = "/etc/systemd/system/agent-firewall.service", content = base64gzip(file("${local.agent_dir}/agent-firewall.service")), owner = "root:root", permissions = "0644", defer = false },
+    { path = "/etc/systemd/system/agent-poll.timer", content = base64gzip(templatefile("${local.agent_dir}/agent-poll.timer.tftpl", { poll_interval = var.poll_interval })), owner = "root:root", permissions = "0644", defer = false },
+    { path = "/etc/sudoers.d/agent-ctl", content = base64gzip("agent-ctl ALL=(agent) NOPASSWD: /opt/agent/run-claude.sh\n"), owner = "root:root", permissions = "0440", defer = false },
+    { path = "/etc/agent/bootstrap.env", content = base64gzip(local.bootstrap_env), owner = "root:root", permissions = "0600", defer = false },
+    { path = "/etc/agent/agent.env", content = base64gzip(local.agent_env), owner = "agent-ctl:agent-ctl", permissions = "0600", defer = true },
+    { path = "/etc/agent/model-key", content = base64gzip(var.do_model_access_key), owner = "agent:agent", permissions = "0600", defer = true },
+    { path = "/home/agent/.claude/settings.json", content = base64gzip(local.claude_settings), owner = "agent:agent", permissions = "0644", defer = true },
+    { path = "/home/agent/.gitconfig", content = base64gzip(local.bot_gitconfig), owner = "agent:agent", permissions = "0644", defer = true },
+    { path = "/home/agent-ctl/.gitconfig", content = base64gzip(local.bot_gitconfig), owner = "agent-ctl:agent-ctl", permissions = "0644", defer = true },
   ]
 
   user_data = templatefile("${path.module}/cloud-init.yaml.tftpl", {
