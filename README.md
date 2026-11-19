@@ -39,11 +39,11 @@ comments and reviews to the model. It never creates issues, edits issue bodies o
 |---|---|
 | `agent` | Dan: "work on this". On a bot PR: "do another pass". |
 | `agent:working` | A run is in progress. |
-| `agent:review` | A PR is open for this issue. |
+| `agent:review` | A PR is open for this issue. If the run stopped early (turn limit, timeout, an error) after making commits, the PR is a **draft** saying so: the bot leaves drafts alone, so check the work and mark it ready for review before approving or requesting changes. |
 | `agent:blocked` | Waiting on open `Blocked by` issues (native dependencies or `Blocked by #N` / `Depends on #N` in the body). |
 | `agent:needs-info` | The bot asked questions in a comment. Answer, then re-add `agent`. |
-| `agent:failed` | The run failed; see its comment. Re-add `agent` to retry. |
-| `agent:rate-limited` | Not enough model quota: the pre-flight check found under `min_quota_tokens` left, or the provider refused the run (HTTP 429). The bot runs no model jobs for `rate_limit_backoff` seconds (default an hour), then retries this by itself. Remove the label to cancel. |
+| `agent:failed` | The run failed without usable commits (or its push failed); see its comment. Re-add `agent` to retry. |
+| `agent:rate-limited` | Not enough model quota: the pre-flight check found under `min_quota_tokens` left, or the provider refused the run (HTTP 429). The bot runs no model jobs for `rate_limit_backoff` seconds (default an hour), then retries this by itself, carrying on from any commits the cut-short run made. Remove the label to cancel. |
 
 ## Setup
 

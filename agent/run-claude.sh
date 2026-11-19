@@ -6,7 +6,8 @@
 # agent never holds the GitHub token. Work crosses back to agent-ctl only through files that
 # agent-ctl pre-created in the job dir (which agent can't create, rename or symlink in):
 #   in:  prompt.md, base.bundle (ref refs/jobs/base = the commit to start from)
-#   out: events.jsonl (claude's stream-json events), changes.bundle (new commits), needs-info.md
+#   out: events.jsonl (claude's stream-json events), changes.bundle (new commits), needs-info.md,
+#        summary.jsonl (the final message, when the run hit --max-turns)
 #
 # Exits 75 without running Claude when the model key has fewer than <min-quota> tokens of daily
 # quota left (0 skips the check). agent-poll.sh treats that as a rate limit.
@@ -137,4 +138,28 @@ setsid claude -p \
 claude_pid=$!
 rc=0
 wait "$claude_pid" || rc=$?
+claude_pid=
+
+# --- Out of turns: resume the session for its final message -----------------------------------
+# A run that hits --max-turns ends without the final message that becomes the PR description or
+# comment. One more reply from the same session gets it, cheaply: its context is still cached.
+# Same model and tools as the run, so the cached prefix matches. The run's exit code stands.
+sid=$(jq -rs 'map(select(.type? == "system" and .subtype? == "init")) | first | .session_id? // empty' \
+  "$job/events.jsonl" 2>/dev/null) || sid=
+ended=$(jq -rs 'map(select(.type? == "result")) | last | .subtype? // empty' "$job/events.jsonl" 2>/dev/null) || ended=
+if [[ $ended == error_max_turns && $sid =~ ^[0-9a-fA-F-]{36}$ ]]; then
+  setsid claude -p \
+    --resume "$sid" \
+    --model "$model" \
+    --max-turns 2 \
+    --disallowedTools "$DISALLOWED_TOOLS" \
+    --output-format stream-json \
+    --verbose \
+    --dangerously-skip-permissions \
+    <<<"You have reached this run's turn limit, so don't use any more tools. Write your final message now, in the format your instructions asked for: it becomes the pull request description (or the comment on it). Say plainly what is finished, what isn't, and what you didn't get to check." \
+    >"$job/summary.jsonl" &
+  claude_pid=$!
+  wait "$claude_pid" || true
+  claude_pid=
+fi
 exit "$rc"

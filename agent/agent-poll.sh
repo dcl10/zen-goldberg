@@ -118,7 +118,7 @@ new_job() {
   git -C "$CLONE" bundle create -q "$job/base.bundle" refs/jobs/base
   chmod 0640 "$job/base.bundle"
   local f
-  for f in events.jsonl needs-info.md changes.bundle; do
+  for f in events.jsonl needs-info.md changes.bundle summary.jsonl; do
     : >"$job/$f"
     chmod 0660 "$job/$f"
   done
@@ -130,6 +130,8 @@ new_job() {
 #   JOB_SUBTYPE, JOB_IS_ERROR, JOB_RESULT: from Claude's final result event; without one,
 #     JOB_SUBTYPE is timeout, quota_low or no_result and JOB_RESULT is empty
 #   JOB_LAST_TEXT: Claude's last text message, for runs that ended without a result
+#   JOB_SUMMARY: the final message a run that hit --max-turns wrote when resumed for it (its
+#     usage is included in JOB_USAGE)
 #   JOB_RETRIES, JOB_RL_RETRIES, JOB_STUCK_429: API retries, those for 429s, and whether
 #     the run was killed while retrying a 429
 #   JOB_USAGE, JOB_USAGE_PARTIAL: per-model token usage (see "Token usage"); partial when it
@@ -179,12 +181,26 @@ run_job() {
   JOB_RL_RETRIES=$(jq -r '.rate_limit_retries // 0' <<<"$summary")
   JOB_STUCK_429=$(jq -r '.stuck_on_429 == true' <<<"$summary")
 
+  JOB_SUMMARY=
+  if [[ -s $job/summary.jsonl ]]; then
+    cp "$job/summary.jsonl" "$LOG_DIR/$id.summary.jsonl"
+    summary=$(head -c 67108864 "$job/summary.jsonl" | jq -n -R -c --argjson ids "$MODEL_IDS" "$USAGE_JQ run_summary(\$ids)" 2>/dev/null) ||
+      summary='{}'
+    jq -e 'type == "object"' <<<"$summary" >/dev/null 2>&1 || summary='{}'
+    log "job $id: final message after the turn limit: $(jq -c '{subtype, is_error, num_turns, usage}' <<<"$summary")"
+    JOB_USAGE=$(jq -c --argjson b "$(jq -c '.usage // {}' <<<"$summary")" "$USAGE_JQ add_usage(.; \$b)" <<<"$JOB_USAGE")
+    if [[ $(jq -r '.final == true and .is_error == false' <<<"$summary") == true ]]; then
+      JOB_SUMMARY=$(jq -r '.result // "" | tostring' <<<"$summary")
+    fi
+  fi
+
   JOB_NEEDS=$(head -c "$MAX_BODY" "$job/needs-info.md")
   # The usage section's markers are ours alone: model text carrying them could hijack the
   # section on the next revision (whatever the target repo's CLAUDE.md tells the model).
   JOB_RESULT=${JOB_RESULT//"$USAGE_START"/} JOB_RESULT=${JOB_RESULT//"$USAGE_END"/}
   JOB_NEEDS=${JOB_NEEDS//"$USAGE_START"/} JOB_NEEDS=${JOB_NEEDS//"$USAGE_END"/}
   JOB_LAST_TEXT=${JOB_LAST_TEXT//"$USAGE_START"/} JOB_LAST_TEXT=${JOB_LAST_TEXT//"$USAGE_END"/}
+  JOB_SUMMARY=${JOB_SUMMARY//"$USAGE_START"/} JOB_SUMMARY=${JOB_SUMMARY//"$USAGE_END"/}
 
   JOB_COMMITS=0 JOB_HEAD=$base
   if [[ -s $job/changes.bundle ]]; then
@@ -223,6 +239,8 @@ job_rate_limited() {
 job_how() {
   if [[ $JOB_TIMED_OUT == true ]]; then
     printf 'timed out after %s' "$AGENT_JOB_TIMEOUT"
+  elif [[ $JOB_SUBTYPE == error_max_turns ]]; then
+    printf 'hit the %s-turn limit' "$AGENT_MAX_TURNS"
   else
     printf '`%s`, exit %s' "$JOB_SUBTYPE" "$JOB_RC"
   fi
@@ -235,6 +253,8 @@ job_how() {
 job_summary_md() {
   if [[ -n $JOB_RESULT ]]; then
     printf '%s\n' "$JOB_RESULT"
+  elif [[ -n $JOB_SUMMARY ]]; then
+    printf '%s\n' "$JOB_SUMMARY"
   elif [[ -n $JOB_LAST_TEXT ]]; then
     printf 'It stopped before writing a summary. Its last message:\n\n'
     sed 's/^/> /' <<<"$JOB_LAST_TEXT"
@@ -591,11 +611,17 @@ do_revise() {
 
   run_job "$job" "$branch" "$sha"
 
-  local pushed=true failed=false body
+  local pushed=true failed=false stopped=false body
   if ((JOB_COMMITS > 0)); then
     push "$JOB_HEAD" "$branch" || pushed=false
   fi
-  if job_failed || [[ $pushed == false ]]; then failed=true; fi
+  # A run that stopped early (turn limit, timeout, an error) but pushed commits may well have
+  # done the job: that's for the owner to judge from the commits, so it isn't marked failed.
+  if [[ $pushed == false ]] || { job_failed && ((JOB_COMMITS == 0)); }; then
+    failed=true
+  elif job_failed; then
+    stopped=true
+  fi
 
   # Every run counts toward the PR's total, failed ones included; one the pre-flight check
   # stopped never started.
@@ -621,14 +647,16 @@ do_revise() {
     if [[ $failed == true ]]; then
       printf '**This revision run failed** (%s). Re-add `agent` to retry.\n\n' "$(job_how)"
       [[ $pushed == false ]] && printf '%s\n\n' "$PUSH_HINT"
-      ((JOB_COMMITS > 0)) && [[ $pushed == true ]] && printf 'Partial work (%s commit(s)) was pushed.\n\n' "$JOB_COMMITS"
+    elif [[ $stopped == true ]]; then
+      printf '**This revision stopped before it finished** (%s). Its %s commit(s) are pushed: check whether ' "$(job_how)" "$JOB_COMMITS"
+      printf 'they cover the feedback. To have me carry on, request changes again or add `agent`.\n\n'
     fi
     printf '%s\n' "$body"
   } | comment_run "$n"
 
   [[ $failed == true ]] && label_add "$n" agent:failed
   label_rm "$n" agent:working
-  log "PR #$n: revision done (failed=$failed, commits=$JOB_COMMITS)"
+  log "PR #$n: revision done (failed=$failed, stopped=$stopped, commits=$JOB_COMMITS)"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -782,26 +810,31 @@ do_issue() {
     return
   fi
 
-  if job_failed; then
-    {
-      printf '**Partial work on branch `%s`, no PR** (%s). ' "$branch" "$(job_how)"
-      printf 'Re-adding `agent` starts again from `%s` and replaces this branch; ' "$AGENT_DEFAULT_BRANCH"
-      printf 'if the work looks done, open a PR from it yourself.\n\n'
-      job_summary_md
-    } | comment_run "$n"
-    label_add "$n" agent:failed
-    log "#$n: failed, partial work pushed"
-    return
-  fi
-
-  local body_file=$job/pr-body.md footer existing pr_title="$title (#$n)"
+  # A run that stopped early (turn limit, timeout, an error) may still have finished the work.
+  # The owner judges that from the commits, so they go up as a draft PR instead of failing the
+  # issue. Drafts are left alone (bot_prs) until the owner marks them ready for review.
+  local incomplete=false body_file=$job/pr-body.md footer existing pr_title="$title (#$n)" text
+  job_failed && incomplete=true
   if [[ $AGENT_AUTO_MERGE == true ]]; then
     footer="**Approve** and I'll squash-merge on my next poll. **Request changes** (inline comments welcome) and I'll revise. To ask for another pass without a review, add the \`agent\` label to this PR."
   else
     footer="**Request changes** (inline comments welcome) and I'll revise; merge it yourself when happy. To ask for another pass without a review, add the \`agent\` label to this PR."
   fi
+  if [[ $incomplete == true ]]; then
+    text=$(job_summary_md)
+  else
+    text=${JOB_RESULT:-(no summary)}
+  fi
   {
-    printf '%s\n' "${JOB_RESULT:-(no summary)}" | head -c $((MAX_BODY - 6000))
+    if [[ $incomplete == true ]]; then
+      printf '> [!WARNING]\n> **Draft: this run stopped before it finished** (%s). Check whether the work is complete. ' "$(job_how)"
+      printf 'I leave drafts alone, so mark it **ready for review** first, then use the options at the bottom.\n\n'
+    fi
+    printf '%s\n' "${text:0:$((MAX_BODY - 10000))}"
+    if [[ $incomplete == true ]]; then
+      printf '\n**Commits on this branch**\n\n'
+      git -C "$CLONE" log -n 50 --format='- %h %s' "$main_sha..$JOB_HEAD"
+    fi
     printf '\n'
     pr_usage_section
     printf '\nCloses #%s\n\n---\n\n_Opened by the Helix Reborn agent._ %s\n' "$n" "$footer"
@@ -810,11 +843,11 @@ do_issue() {
   existing=$(api "repos/$R/pulls?state=open&head=$REPO_OWNER:$branch" -q '.[0].number // empty')
   if [[ -n $existing ]]; then
     api -X PATCH "repos/$R/pulls/$existing" -f title="$pr_title" -F body=@"$body_file" >/dev/null
-    log "#$n: updated PR #$existing"
+    log "#$n: updated PR #$existing (incomplete=$incomplete)"
   else
     existing=$(api -X POST "repos/$R/pulls" -f title="$pr_title" -f head="$branch" -f base="$AGENT_DEFAULT_BRANCH" \
-      -F body=@"$body_file" -q .number)
-    log "#$n: opened PR #$existing"
+      -F draft="$incomplete" -F body=@"$body_file" -q .number)
+    if [[ $incomplete == true ]]; then log "#$n: opened draft PR #$existing (run stopped early)"; else log "#$n: opened PR #$existing"; fi
   fi
   label_add "$n" agent:review
 }
