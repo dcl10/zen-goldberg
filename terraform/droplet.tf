@@ -2,7 +2,8 @@ locals {
   agent_dir = "${path.module}/../agent"
 
   # /etc/agent/agent.env, read by systemd (EnvironmentFile) for agent-poll.service only.
-  # Every value is validated in variables.tf, so plain double quotes are safe.
+  # Every value is validated in variables.tf, so plain double quotes are safe (single quotes
+  # for the JSON, which has no single quotes in it).
   agent_env = <<-EOT
     AGENT_REPO="${var.github_owner}/${var.github_repo}"
     AGENT_DEFAULT_BRANCH="${var.default_branch}"
@@ -12,6 +13,9 @@ locals {
     AGENT_MAX_TURNS="${var.max_turns}"
     AGENT_JOB_TIMEOUT="${var.job_timeout}"
     AGENT_AUTO_MERGE="${var.auto_merge_on_approval}"
+    AGENT_MIN_QUOTA_TOKENS="${var.min_quota_tokens}"
+    AGENT_RATE_LIMIT_BACKOFF="${var.rate_limit_backoff}"
+    AGENT_MODEL_IDS='${jsonencode(var.model_overrides)}'
     GH_TOKEN="${var.bot_github_token}"
   EOT
 
@@ -31,6 +35,9 @@ locals {
       CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS   = "1"
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
       DISABLE_AUTOUPDATER                      = "1"
+      # Few retries, so a quota 429 ends the run (and the poll script requeues it) instead of
+      # the run crawling from retry to retry until the job timeout.
+      CLAUDE_CODE_MAX_RETRIES = tostring(var.model_max_retries)
       # Every alias lands on a model the key allows. The key has no Opus, so opus goes to
       # the main model too.
       ANTHROPIC_DEFAULT_SONNET_MODEL = var.model

@@ -43,7 +43,7 @@ comments and reviews to the model. It never creates issues, edits issue bodies o
 | `agent:blocked` | Waiting on open `Blocked by` issues (native dependencies or `Blocked by #N` / `Depends on #N` in the body). |
 | `agent:needs-info` | The bot asked questions in a comment. Answer, then re-add `agent`. |
 | `agent:failed` | The run failed; see its comment. Re-add `agent` to retry. |
-| `agent:rate-limited` | The model provider refused the run for quota (HTTP 429). The bot runs no model jobs for an hour (`AGENT_RATE_LIMIT_BACKOFF` seconds), then retries this by itself. Remove the label to cancel. |
+| `agent:rate-limited` | Not enough model quota: the pre-flight check found under `min_quota_tokens` left, or the provider refused the run (HTTP 429). The bot runs no model jobs for `rate_limit_backoff` seconds (default an hour), then retries this by itself. Remove the label to cancel. |
 
 ## Setup
 
@@ -123,11 +123,22 @@ get `agent:blocked` and wait until the first PR merges.
 
 - Label an issue `agent`. The timer polls every `poll_interval` (default 3 min); one model job per tick.
 - Trigger a tick now: `systemctl start agent-poll` (as root on the box).
-- Per-job logs: `/var/log/agent/<job>.log` (wrapper output, stderr) and `<job>.json` (Claude's JSON result).
+- Per-job logs: `/var/log/agent/<job>.log` (wrapper output, stderr, the quota check) and
+  `<job>.jsonl` (Claude's stream-json events, one per line; the last is the result unless the
+  run was killed). Each `api_retry` event is one retried model request.
+- Quota: DO's daily token bucket refills slowly and a run uses ~2M tokens (cache reads count).
+  Before each job, `run-claude.sh` makes a 1-token request and skips the job if fewer than
+  `min_quota_tokens` are left. Claude Code retries a request only `model_max_retries` times, so
+  a 429 mid-run ends the run quickly and the bot requeues it, instead of the run crawling from
+  retry to retry until `job_timeout`. See what's left:
+  `curl -s -o /dev/null -D - https://inference.do-ai.run/v1/messages -H "x-api-key: $KEY" -H 'anthropic-version: 2023-06-01' -H 'content-type: application/json' -d '{"model":"anthropic-claude-5-sonnet","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' | grep -i remaining-tokens-per-day`
+- A run the job timeout kills is reported as "timed out after …", with its API retries, its last
+  message and the tokens it used up to then.
 - Hand-over dirs from recent jobs: `/srv/agent-work/jobs/` (kept two days).
 - Token usage: each PR body has a per-model table (input, output, cache read, cache write) with
   the total over every run on its issue (failed runs before the PR included) and the latest run;
-  every bot comment after a run shows that run's usage. Running totals live in
+  every bot comment after a run shows that run's usage (added up from the events, and marked
+  partial, for a run that was killed). Running totals live in
   `/srv/agent-work/out/issue-<n>-usage.json`, which a Droplet replacement wipes.
   No dollar cost is shown: Claude Code's figure uses Anthropic list prices, not DO's.
 

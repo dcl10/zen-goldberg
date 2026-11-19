@@ -20,6 +20,10 @@ small_fast_model = "anthropic-claude-5.5-haiku"
 max_turns     = 80
 job_timeout   = "45m"
 poll_interval = "3min"
+# Quota: don't start a run with under ~2M tokens of DO's daily quota left, and look again hourly.
+min_quota_tokens   = 2000000
+rate_limit_backoff = 3600
+model_max_retries  = 3
 
 # GitHub
 github_owner   = "dcl10"
