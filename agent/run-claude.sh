@@ -34,6 +34,7 @@ export DOTNET_ROOT="$HOME/.dotnet" DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
 export XDG_RUNTIME_DIR="/run/user/$uid" DOCKER_HOST="unix:///run/user/$uid/docker.sock"
 
 repo=/srv/agent-work/repo
+DISALLOWED_TOOLS=WebSearch,NotebookEdit,Monitor,ScheduleWakeup,CronCreate,CronDelete,CronList,EnterWorktree,ExitWorktree,ListAgents,SendMessage,TaskStop,Workflow,ReportFindings
 needs=/srv/agent-work/scratch/NEEDS_INFO.md
 base=
 claude_pid=
@@ -121,9 +122,14 @@ base=$fetched
 # --- Run Claude (in its own process group, in the background, so signals reach the trap) -----
 # stream-json writes each event as it happens, so a run killed by the job timeout still leaves
 # its token usage, API retries and last message behind (plain json only prints at the end).
+# Tools that don't fit a one-shot headless job are disallowed: their definitions would be
+# re-sent with every request, and the scheduling ones (Monitor, ScheduleWakeup, Cron*) wait
+# for a wake-up that never comes in `claude -p`, so a run burns turns on them. WebFetch stays:
+# runs use it, and it puts a short summary in the context where curl would put the whole page.
 setsid claude -p \
   --model "$model" \
   --max-turns "$turns" \
+  --disallowedTools "$DISALLOWED_TOOLS" \
   --output-format stream-json \
   --verbose \
   --dangerously-skip-permissions \

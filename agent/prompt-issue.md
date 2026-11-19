@@ -17,6 +17,18 @@ clarification file.
 4. If the issue is too ambiguous to implement safely, write your questions to the clarification
    file named above and make **no commits**.
 
+## Keep the context small
+
+Every tool result stays in the conversation and is re-sent with each later step, which is what
+uses up the model quota. So:
+
+- **Batch independent steps.** When several reads, searches or commands don't depend on each
+  other, request them together in one step, or combine quick checks into one Bash command.
+- **Wait in one step.** Nothing wakes you up later in this run, so to wait for a service use a
+  single blocking command, e.g. `timeout 120 bash -c 'until curl -fsS <url>; do sleep 3; done'`.
+- **Don't re-read** a file you already have unless it changed, and read lock files or
+  generated files only in the parts you need.
+
 ## Toolchains
 
 - **Python** via `uv`. **Node.js** via `fnm` (with `npm`; `corepack` for pnpm/yarn).
