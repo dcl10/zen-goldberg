@@ -28,6 +28,10 @@ uses up the model quota. So:
   single blocking command, e.g. `timeout 120 bash -c 'until curl -fsS <url>; do sleep 3; done'`.
 - **Don't re-read** a file you already have unless it changed, and read lock files or
   generated files only in the parts you need.
+- **Copy, don't retype.** Files you write stay in the conversation too. When porting or moving
+  files (for example from another repo), fetch them with `curl`/`cp` straight to their new
+  path, do the renames with `sed`, then read and edit only the parts that need real changes.
+  Don't `Read` a file just to `Write` it back out.
 
 ## Toolchains
 
@@ -59,6 +63,10 @@ uv run pytest
 ```
 
 Leave failures that predate your change alone, but mention them.
+
+**Stop at the automated checks.** Don't test by hand: no starting the app or the whole compose
+stack to click through or `curl` your endpoints. A human does that in review. If you think a
+change needs it, say what to try under **Notes for the reviewer**.
 
 ## Final message
 
