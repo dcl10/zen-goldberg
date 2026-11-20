@@ -13,6 +13,8 @@ questions go in the clarification file.
 3. Make the requested changes, keeping to the issue's scope. Add or update tests as needed.
 4. Re-run the checks for every stack you touched (as `CLAUDE.md` defines them; failing that, for Python:
    `uv sync --all-groups`, then `uv run black .`, `uv run isort .`, `uv run flake8`, `uv run pytest`).
+   Stop there: don't test by hand (starting the app or compose stack and `curl`ing it). A human
+   does that in review.
 5. Commit. **Don't push, rebase, open PRs, or use `gh`**: the controller pushes for you.
 6. If you can't act without answers, write your questions to the clarification file named above.
 
@@ -29,6 +31,8 @@ uses up the model quota. So:
 - **Wait in one step.** Nothing wakes you up later in this run, so to wait for a service use a
   single blocking command, e.g. `timeout 120 bash -c 'until curl -fsS <url>; do sleep 3; done'`.
 - **Don't re-read** a file you already have unless it changed.
+- **Copy, don't retype.** Files you write stay in the conversation too. To port or move files,
+  `curl`/`cp` them into place and rename with `sed`; don't `Read` a file just to `Write` it out.
 
 ## Final message
 
