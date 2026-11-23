@@ -43,7 +43,7 @@ comments and reviews to the model. It never creates issues, edits issue bodies o
 | `agent:blocked` | Waiting on open `Blocked by` issues (native dependencies or `Blocked by #N` / `Depends on #N` in the body). |
 | `agent:needs-info` | The bot asked questions in a comment. Answer, then re-add `agent`. |
 | `agent:failed` | The run failed without usable commits (or its push failed); see its comment. Re-add `agent` to retry. |
-| `agent:rate-limited` | Not enough model quota: the pre-flight check found under `min_quota_tokens` left, or the provider refused the run (HTTP 429). The bot runs no model jobs for `rate_limit_backoff` seconds (default an hour), then retries this by itself, carrying on from any commits the cut-short run made. Remove the label to cancel. |
+| `agent:rate-limited` | Not enough model quota: the pre-flight check found under `min_quota_tokens` left, or the provider refused the run (HTTP 429). The bot runs no model jobs for `rate_limit_backoff` seconds (default 15 minutes), then checks the quota again, and keeps checking at that interval until enough is free. It then retries this by itself, carrying on from any commits the cut-short run made. Each retry that runs and gets limited again comments with its progress. Checks that find too little quota leave the issue untouched. Remove the label to cancel. |
 
 ## Setup
 
