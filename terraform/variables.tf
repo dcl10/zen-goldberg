@@ -179,9 +179,9 @@ variable "min_quota_tokens" {
 }
 
 variable "rate_limit_backoff" {
-  description = "Seconds without model jobs after a run is rate-limited or stopped by the quota check. A retry that the quota check stops costs ~1 token, so this is how often to look, not how long to rest."
+  description = "Seconds without model jobs after a run is rate-limited or stopped by the quota check; then the quota is checked again (a 1-token request, no label changes) until min_quota_tokens are free. So this is how often to look, not how long to rest."
   type        = number
-  default     = 3600
+  default     = 900
 
   validation {
     condition     = var.rate_limit_backoff >= 60 && var.rate_limit_backoff == floor(var.rate_limit_backoff)
