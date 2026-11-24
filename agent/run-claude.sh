@@ -5,9 +5,11 @@
 #
 # agent never holds the GitHub token. Work crosses back to agent-ctl only through files that
 # agent-ctl pre-created in the job dir (which agent can't create, rename or symlink in):
-#   in:  prompt.md, base.bundle (ref refs/jobs/base = the commit to start from)
+#   in:  prompt.md, base.bundle (ref refs/jobs/base = the commit to start from), notes-prev.md
+#        (optional: the notes an earlier, rate-limited attempt left, to seed the notes file with)
 #   out: events.jsonl (claude's stream-json events), changes.bundle (new commits), needs-info.md,
-#        summary.jsonl (the final message, when the run hit --max-turns)
+#        notes.md (the notes file as the run left it), summary.jsonl (the final message, when
+#        the run hit --max-turns)
 #
 # Exits 75 without running Claude when the model key has fewer than <min-quota> tokens of daily
 # quota left (0 skips the check). agent-poll.sh treats that as a rate limit.
@@ -83,6 +85,7 @@ $check_only && exit 0
 repo=/srv/agent-work/repo
 DISALLOWED_TOOLS=WebSearch,NotebookEdit,Monitor,ScheduleWakeup,CronCreate,CronDelete,CronList,EnterWorktree,ExitWorktree,ListAgents,SendMessage,TaskStop,Workflow,ReportFindings
 needs=/srv/agent-work/scratch/NEEDS_INFO.md
+notes=/srv/agent-work/scratch/NOTES.md
 base=
 claude_pid=
 
@@ -102,6 +105,10 @@ finish() {
   fi
   if [[ -f $needs && ! -L $needs ]]; then
     head -c 65536 "$needs" >"$job/needs-info.md"
+  fi
+  # Only once this job has reset it: before that, the file may be an earlier job's.
+  if [[ -n $base && -f $notes && ! -L $notes ]]; then
+    head -c 65536 "$notes" >"$job/notes.md"
   fi
   timeout 60 docker ps -aq | xargs -r timeout 120 docker rm -f >/dev/null
   timeout 60 docker network prune -f >/dev/null
@@ -128,7 +135,10 @@ fetched=$(git rev-parse FETCH_HEAD)
 git checkout -q -f -B "$branch" "$fetched"
 git reset -q --hard "$fetched"
 git clean -q -ffdx -e .venv
-rm -f "$needs"
+rm -f "$needs" "$notes"
+if [[ -f $job/notes-prev.md && ! -L $job/notes-prev.md ]]; then
+  head -c 65536 "$job/notes-prev.md" >"$notes"
+fi
 base=$fetched
 
 # --- Run Claude (in its own process group, in the background, so signals reach the trap) -----
