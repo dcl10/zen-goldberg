@@ -20,6 +20,12 @@ CLONE=$STATE_DIR/repo.git
 JOBS=/srv/agent-work/jobs
 OUT_DIR=/srv/agent-work/out
 NEEDS_INFO=/srv/agent-work/scratch/NEEDS_INFO.md
+# The run's running notes (findings, decisions, what's left). A rate-limited run can't wrap up,
+# so this is what a retry gets back besides the commits: $STATE_DIR/<issue|pr>-<n>-notes.md
+# keeps it between attempts, and the retry's prompt carries it. Capped, since the prompt is
+# re-sent with every step.
+NOTES=/srv/agent-work/scratch/NOTES.md
+NOTES_MAX=16000
 LOG_DIR=/var/log/agent
 PROMPTS=/opt/agent
 LOCK=${RUNTIME_DIRECTORY:-/run/agent-poll}/lock
@@ -119,7 +125,8 @@ sync_clone() {
   git -C "$CLONE" fetch -q --prune --no-tags origin
 }
 
-# new_job <name> <base-sha>: create the hand-over dir and print its path.
+# new_job <name> <base-sha> [<notes>]: create the hand-over dir and print its path. <notes>
+# (text) seeds the run's notes file.
 new_job() {
   local job
   job="$JOBS/$(date -u +%Y%m%dT%H%M%SZ)-$1"
@@ -127,8 +134,12 @@ new_job() {
   git -C "$CLONE" update-ref refs/jobs/base "$2"
   git -C "$CLONE" bundle create -q "$job/base.bundle" refs/jobs/base
   chmod 0640 "$job/base.bundle"
+  if [[ -n ${3:-} ]]; then
+    printf '%s\n' "$3" >"$job/notes-prev.md"
+    chmod 0640 "$job/notes-prev.md"
+  fi
   local f
-  for f in events.jsonl needs-info.md changes.bundle summary.jsonl; do
+  for f in events.jsonl needs-info.md notes.md changes.bundle summary.jsonl; do
     : >"$job/$f"
     chmod 0660 "$job/$f"
   done
@@ -147,6 +158,7 @@ new_job() {
 #   JOB_USAGE, JOB_USAGE_PARTIAL: per-model token usage (see "Token usage"); partial when it
 #     had to be added up from the events because the run never finished
 #   JOB_NEEDS, JOB_COMMITS, JOB_HEAD: clarification questions and returned commits
+#   JOB_NOTES: the run's notes file as it left it (capped at NOTES_MAX bytes)
 # Everything read back from the job dir was written by `agent`: treat it as untrusted data.
 run_job() {
   local job=$1 branch=$2 base=$3 id summary
@@ -205,6 +217,7 @@ run_job() {
   fi
 
   JOB_NEEDS=$(head -c "$MAX_BODY" "$job/needs-info.md")
+  JOB_NOTES=$(head -c "$NOTES_MAX" "$job/notes.md")
   # The usage section's markers are ours alone: model text carrying them could hijack the
   # section on the next revision (whatever the target repo's CLAUDE.md tells the model).
   JOB_RESULT=${JOB_RESULT//"$USAGE_START"/} JOB_RESULT=${JOB_RESULT//"$USAGE_END"/}
@@ -232,6 +245,43 @@ run_job() {
 }
 
 job_failed() { [[ $JOB_RC -ne 0 || $JOB_IS_ERROR == true ]]; }
+
+# notes_take <file>: print the notes an earlier, rate-limited attempt left in <file>, and
+# remove it. Only a rate-limit retry should call this; any other start drops them unread.
+notes_take() {
+  [[ -s $1 ]] && head -c "$NOTES_MAX" "$1"
+  rm -f "$1"
+}
+
+# notes_keep <file> <earlier-notes>: after a rate-limited run, keep its notes for the retry
+# (or the earlier ones, if this run left none, e.g. the pre-flight check stopped it).
+notes_keep() {
+  local text=${JOB_NOTES:-$2}
+  [[ -n $text ]] && printf '%s\n' "$text" >"$1"
+  return 0
+}
+
+# notes_md <earlier-notes>: the prompt section on the notes file.
+notes_md() {
+  printf '\n\n## Notes file\n\n'
+  printf 'Any step of this run can be the last: the daily model quota can run out mid-run, with no '
+  printf 'chance to wrap up. The next attempt then gets only your commits and the notes file `%s`; ' "$NOTES"
+  printf 'everything else you learned is lost. So keep that file current as you go, in a few lines each:\n\n'
+  printf -- '- the plan, what is done and what is left;\n'
+  printf -- '- decisions and why;\n'
+  printf -- '- facts you checked that the code doesn'\''t make obvious (API behaviour, versions, how the tests '
+  printf 'are set up, environment quirks and their workarounds);\n'
+  printf -- '- the files that matter, one line each.\n\n'
+  printf 'No code or command output. Update it once you have your bearings and after each piece of '
+  printf 'work, in the same step as other tool calls, and keep it under about 100 lines: it is in '
+  printf 'the next attempt'\''s prompt. It stays out of the repo, so don'\''t commit it.\n'
+  if [[ -n $1 ]]; then
+    printf '\n### Notes from the earlier attempt\n\n'
+    printf 'These are already in the notes file: build on them, don'\''t start it again. Trust what they '
+    printf 'say was checked, and skip the reading they already cover: read only the files you are about to change.\n\n'
+    printf '<notes>\n%s\n</notes>\n' "$1"
+  fi
+}
 
 # The run never started or stopped for quota: the pre-flight check found too little left; or
 # Claude Code ran out of retries on a 429 and ended with a result like "API Error: Request
@@ -649,16 +699,19 @@ revise_one() {
 
 do_revise() {
   local pr=$1 n branch issue sha title last job prompt feedback was_limited=false attempts_file attempts
+  local notes_file notes=
   n=$(jq -r .number <<<"$pr")
   branch=$(jq -r .head.ref <<<"$pr")
   sha=$(jq -r .head.sha <<<"$pr")
   title=$(jq -r .title <<<"$pr")
   issue=${branch#agent/issue-}
   attempts_file=$STATE_DIR/pr-$n-attempts
+  notes_file=$STATE_DIR/pr-$n-notes.md
   has_label "$pr" agent:rate-limited && was_limited=true
   if [[ $was_limited == true ]] && ! quota_ok "$n"; then return; fi
   attempts=$(attempts_read "$attempts_file" "$was_limited")
   rm -f "$attempts_file"
+  if [[ $was_limited == true ]]; then notes=$(notes_take "$notes_file"); else rm -f "$notes_file"; fi
 
   label_rm "$n" agent
   label_rm "$n" agent:failed
@@ -667,7 +720,7 @@ do_revise() {
 
   last=$(bot_last_activity "$n")
   git -C "$CLONE" cat-file -e "$sha^{commit}"
-  job=$(new_job "pr-$n" "$sha")
+  job=$(new_job "pr-$n" "$sha" "$notes")
 
   feedback=$(
     {
@@ -693,7 +746,9 @@ do_revise() {
     jq -r '.body // "(no description)"' <<<"$pr"
     printf '\n\n## Feedback from @%s (oldest first; [NEW] = since your last update)\n\n' "$AGENT_OWNER"
     if [[ -n $feedback ]]; then printf '%s\n' "$feedback"; else printf '(No written feedback: @%s asked for another pass.)\n' "$AGENT_OWNER"; fi
-    printf '\n## Clarification file\n\nIf you need answers before you can act, write your questions to `%s`.\n\n---\n\n' "$NEEDS_INFO"
+    printf '\n## Clarification file\n\nIf you need answers before you can act, write your questions to `%s`.' "$NEEDS_INFO"
+    notes_md "$notes"
+    printf '\n---\n\n'
     cat "$PROMPTS/prompt-revise.md"
   } >"$job/prompt.md"
 
@@ -722,6 +777,7 @@ do_revise() {
 
   # Any partial commits are already pushed, so the retry carries on from them.
   if job_rate_limited && [[ $pushed == true ]]; then
+    notes_keep "$notes_file" "$notes"
     rate_limited_again pr "$n" "$was_limited" "$attempts" "$attempts_file" "$branch"
     label_rm "$n" agent:working
     return
@@ -800,11 +856,13 @@ pick_issue() {
 
 do_issue() {
   local issue=$1 n title branch base main_sha job comments was_limited=false resume_file resume_sha= attempts_file attempts
+  local notes_file notes=
   n=$(jq -r .number <<<"$issue")
   title=$(jq -r .title <<<"$issue")
   branch=agent/issue-$n
   resume_file=$STATE_DIR/issue-$n-resume
   attempts_file=$STATE_DIR/issue-$n-attempts
+  notes_file=$STATE_DIR/issue-$n-notes.md
   has_label "$issue" agent:rate-limited && was_limited=true
   if [[ $was_limited == true ]] && ! quota_ok "$n"; then return; fi
   attempts=$(attempts_read "$attempts_file" "$was_limited")
@@ -825,10 +883,12 @@ do_issue() {
     [[ $(git -C "$CLONE" rev-parse -q --verify "refs/remotes/origin/$branch" || true) == "$resume_sha" ]] || resume_sha=
   fi
   rm -f "$resume_file"
+  # A retry also gets the cut-short attempt's notes, with or without commits to resume from.
+  if [[ $was_limited == true ]]; then notes=$(notes_take "$notes_file"); else rm -f "$notes_file"; fi
 
   main_sha=$(git -C "$CLONE" rev-parse "refs/remotes/origin/$AGENT_DEFAULT_BRANCH")
   base=${resume_sha:-$main_sha}
-  job=$(new_job "issue-$n" "$base")
+  job=$(new_job "issue-$n" "$base" "$notes")
   comments=$(owner_comments_md "$n")
 
   {
@@ -838,13 +898,16 @@ do_issue() {
       printf 'attempt that the model rate limit cut short. Its commits since `%s` (%s):\n\n' "$AGENT_DEFAULT_BRANCH" "${main_sha:0:12}"
       git -C "$CLONE" log -n 50 --oneline --no-decorate "$main_sha..$resume_sha" | sed 's/^/    /'
       printf '\nCheck what is already done (`git diff %s..HEAD --stat`, then the parts you need) ' "${main_sha:0:12}"
-      printf 'and carry on from there; don'\''t redo finished work. Uncommitted work from that attempt is lost.\n\n## Issue body\n\n'
+      printf 'and carry on from there; don'\''t redo finished work. Its last commit may be an automatic snapshot of '
+      printf 'edits it hadn'\''t finished, so check that one before building on it.\n\n## Issue body\n\n'
     else
       printf 'You are on a fresh branch `%s`, made from `%s`.\n\n## Issue body\n\n' "$branch" "$AGENT_DEFAULT_BRANCH"
     fi
     jq -r '.body // "(no body)"' <<<"$issue"
     if [[ -n $comments ]]; then printf '\n\n## Comments from @%s (oldest first)\n\n%s\n' "$AGENT_OWNER" "$comments"; fi
-    printf '\n\n## Clarification file\n\nIf the issue is too ambiguous to implement, write your questions to `%s` and make no commits.\n\n---\n\n' "$NEEDS_INFO"
+    printf '\n\n## Clarification file\n\nIf the issue is too ambiguous to implement, write your questions to `%s` and make no commits.' "$NEEDS_INFO"
+    notes_md "$notes"
+    printf '\n---\n\n'
     cat "$PROMPTS/prompt-issue.md"
   } >"$job/prompt.md"
 
@@ -874,6 +937,7 @@ do_issue() {
     elif [[ -n $resume_sha ]]; then
       printf '%s\n' "$resume_sha" >"$resume_file"
     fi
+    notes_keep "$notes_file" "$notes"
     rate_limited_again issue "$n" "$was_limited" "$attempts" "$attempts_file" "$pushed_to"
     return
   fi
