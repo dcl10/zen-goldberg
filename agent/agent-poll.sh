@@ -26,10 +26,18 @@ LOCK=${RUNTIME_DIRECTORY:-/run/agent-poll}/lock
 MAX_BODY=60000
 # After a run is refused for quota (HTTP 429, or the pre-flight check), no model jobs until this
 # file's epoch time; the issue or PR gets agent:rate-limited. When the pause ends, a 1-token
-# check looks at the quota again: the retry starts once enough is back, and otherwise the
-# pause is renewed without touching the issue. So the backoff is how often to look.
+# check looks at the quota again: the retry starts once RETRY_QUOTA_TOKENS are back (a full
+# bucket, so a retry isn't cut short again), and otherwise the pause is renewed without
+# touching the issue. So the backoff is how often to look.
 RATE_LIMIT_FILE=$STATE_DIR/rate-limited-until
 RATE_LIMIT_BACKOFF=${AGENT_RATE_LIMIT_BACKOFF:-900}
+RETRY_QUOTA_TOKENS=${AGENT_RETRY_QUOTA_TOKENS:-4500000}
+[[ $RETRY_QUOTA_TOKENS =~ ^[0-9]{1,12}$ ]] || RETRY_QUOTA_TOKENS=4500000
+# Runs an issue or PR gets per queueing (the owner's `agent` label or changes-requested review
+# starts a fresh count). A run that is rate-limited on the last one marks it failed instead of
+# queueing another retry.
+MAX_ATTEMPTS=${AGENT_MAX_ATTEMPTS:-5}
+[[ $MAX_ATTEMPTS =~ ^[1-9][0-9]{0,3}$ ]] || MAX_ATTEMPTS=5
 # run-claude.sh's exit code when its pre-flight check finds too little daily quota left.
 QUOTA_LOW_EXIT=75
 # Anthropic model ID => DO model ID (Terraform's model_overrides). Claude Code's per-message
@@ -281,12 +289,13 @@ pause_jobs() {
   date -u -d "@$resume" '+%Y-%m-%d %H:%M UTC'
 }
 
-# quota_ok <issue-or-pr>: run-claude.sh's pre-flight check on its own. When it finds too little
-# quota for a rate-limited retry, renew the pause and fail, before any label changes, so a
-# waiting issue's timeline isn't filled with label churn every few minutes.
+# quota_ok <issue-or-pr>: run-claude.sh's pre-flight check on its own, against
+# RETRY_QUOTA_TOKENS. When it finds too little quota for a rate-limited retry, renew the pause
+# and fail, before any label changes, so a waiting issue's timeline isn't filled with label
+# churn every few minutes.
 quota_ok() {
   local n=$1 rc=0 out when
-  out=$(sudo -n -u agent /opt/agent/run-claude.sh --quota-check "$AGENT_MODEL" "$AGENT_MIN_QUOTA_TOKENS" 2>&1) || rc=$?
+  out=$(sudo -n -u agent /opt/agent/run-claude.sh --quota-check "$AGENT_MODEL" "$RETRY_QUOTA_TOKENS" 2>&1) || rc=$?
   [[ -z $out ]] || log "#$n: ${out#run-claude: }"
   ((rc == QUOTA_LOW_EXIT)) || return 0
   when=$(pause_jobs)
@@ -294,15 +303,62 @@ quota_ok() {
   return 1
 }
 
-# rate_limit_requeue <issue-or-pr> <already-rate-limited> [<branch>]: pause model jobs, label
-# <n> for a retry when the pause ends, and comment. A retry the quota check stopped before it
-# began gets no comment (the first one already said it's waiting); one that ran does, with
-# what it got done.
+# attempts_read <file> <already-rate-limited>: runs so far in this queueing. Only a
+# rate-limit retry carries the count on; any other start begins again from 0.
+attempts_read() {
+  local a=0
+  if [[ $2 == true && -s $1 ]]; then
+    a=$(<"$1")
+    [[ $a =~ ^[0-9]{1,6}$ ]] || a=0
+  fi
+  printf '%s\n' "$a"
+}
+
+# rate_limited_again <issue|pr> <number> <already-rate-limited> <attempts> <attempts-file>
+# [<branch>]: after a rate-limited run, queue a retry, or give up once <attempts> runs have
+# used up MAX_ATTEMPTS.
+rate_limited_again() {
+  local kind=$1 n=$2 already=$3 attempts=$4 file=$5 branch=${6:-}
+  if ((attempts >= MAX_ATTEMPTS)); then
+    rm -f "$file"
+    rate_limit_give_up "$kind" "$n" "$attempts" "$branch"
+  else
+    printf '%s\n' "$attempts" >"$file"
+    rate_limit_requeue "$n" "$already" "$attempts" "$branch"
+  fi
+}
+
+# rate_limit_give_up <issue|pr> <number> <attempts> [<branch>]: the last allowed run was
+# rate-limited too. Pause model jobs (the quota is still low), mark <n> failed and comment.
+rate_limit_give_up() {
+  local kind=$1 n=$2 attempts=$3 branch=${4:-} when
+  when=$(pause_jobs)
+  label_add "$n" agent:failed
+  log "#$n: rate limited on attempt $attempts of $MAX_ATTEMPTS; marked failed; no model jobs until $when"
+  {
+    printf '**Reached the limit of %s attempts, so I'\''ve stopped.** ' "$MAX_ATTEMPTS"
+    printf 'Attempt %s was rate-limited too (%s), and I won'\''t retry this by myself again. ' "$attempts" "$(job_how)"
+    if [[ -n $branch ]] && ((JOB_COMMITS > 0)); then
+      printf 'Its %s commit(s) are pushed to `%s`. ' "$JOB_COMMITS" "$branch"
+    fi
+    if [[ $kind == issue ]]; then
+      printf 'Re-add `agent` to start again from `%s`, with a fresh %s attempts.\n\n' "$AGENT_DEFAULT_BRANCH" "$MAX_ATTEMPTS"
+    else
+      printf 'Re-add `agent` to try again, with a fresh %s attempts.\n\n' "$MAX_ATTEMPTS"
+    fi
+    job_summary_md
+  } | comment_run "$n"
+}
+
+# rate_limit_requeue <issue-or-pr> <already-rate-limited> <attempts> [<branch>]: pause model
+# jobs, label <n> for a retry when the pause ends, and comment. A retry the quota check stopped
+# before it began gets no comment (the first one already said it's waiting); one that ran
+# does, with what it got done.
 rate_limit_requeue() {
-  local n=$1 already=$2 branch=${3:-} when
+  local n=$1 already=$2 attempts=$3 branch=${4:-} when
   when=$(pause_jobs)
   label_add "$n" agent:rate-limited
-  log "#$n: rate limited; no model jobs until $when"
+  log "#$n: rate limited (attempt $attempts of $MAX_ATTEMPTS); no model jobs until $when"
   [[ $already == true && $JOB_QUOTA_LOW == true ]] && return
   {
     printf '%s\n' "$RATE_LIMIT_MARK"
@@ -310,15 +366,15 @@ rate_limit_requeue() {
       printf '**Not started: too little model quota left today** (%s tokens; a run needs about %s). ' \
         "$(jq -rn "$USAGE_JQ ${JOB_QUOTA_LEFT:-0} | commas")" "$(jq -rn "$USAGE_JQ $AGENT_MIN_QUOTA_TOKENS | commas")"
     elif [[ $already == true ]]; then
-      printf '**Rate-limited again** (%s). ' "$(job_how)"
+      printf '**Rate-limited again** (attempt %s of %s; %s). ' "$attempts" "$MAX_ATTEMPTS" "$(job_how)"
     else
-      printf '**The model provider rate-limited this run** (%s). ' "$(job_how)"
+      printf '**The model provider rate-limited this run** (attempt %s of %s; %s). ' "$attempts" "$MAX_ATTEMPTS" "$(job_how)"
     fi
     if [[ -n $branch ]] && ((JOB_COMMITS > 0)); then
       printf 'Its %s commit(s) are pushed to `%s`, and the next run carries on from them. ' "$JOB_COMMITS" "$branch"
     fi
-    printf 'I'\''ll check the quota every %s minutes (first at %s) and carry on once about %s tokens are free. ' \
-      "$((RATE_LIMIT_BACKOFF / 60))" "$when" "$(jq -rn "$USAGE_JQ $AGENT_MIN_QUOTA_TOKENS | commas")"
+    printf 'I'\''ll check the quota every %s minutes (first at %s) and carry on once the full %s tokens are back. ' \
+      "$((RATE_LIMIT_BACKOFF / 60))" "$when" "$(jq -rn "$USAGE_JQ $RETRY_QUOTA_TOKENS | commas")"
     printf 'Remove `agent:rate-limited` to cancel.\n\n'
     [[ $JOB_QUOTA_LOW == true ]] || job_summary_md
   } | comment_run "$n"
@@ -592,14 +648,17 @@ revise_one() {
 }
 
 do_revise() {
-  local pr=$1 n branch issue sha title last job prompt feedback was_limited=false
+  local pr=$1 n branch issue sha title last job prompt feedback was_limited=false attempts_file attempts
   n=$(jq -r .number <<<"$pr")
   branch=$(jq -r .head.ref <<<"$pr")
   sha=$(jq -r .head.sha <<<"$pr")
   title=$(jq -r .title <<<"$pr")
   issue=${branch#agent/issue-}
+  attempts_file=$STATE_DIR/pr-$n-attempts
   has_label "$pr" agent:rate-limited && was_limited=true
   if [[ $was_limited == true ]] && ! quota_ok "$n"; then return; fi
+  attempts=$(attempts_read "$attempts_file" "$was_limited")
+  rm -f "$attempts_file"
 
   label_rm "$n" agent
   label_rm "$n" agent:failed
@@ -639,6 +698,7 @@ do_revise() {
   } >"$job/prompt.md"
 
   run_job "$job" "$branch" "$sha"
+  [[ $JOB_QUOTA_LOW == true ]] || attempts=$((attempts + 1))
 
   local pushed=true failed=false stopped=false body
   if ((JOB_COMMITS > 0)); then
@@ -662,7 +722,7 @@ do_revise() {
 
   # Any partial commits are already pushed, so the retry carries on from them.
   if job_rate_limited && [[ $pushed == true ]]; then
-    rate_limit_requeue "$n" "$was_limited" "$branch"
+    rate_limited_again pr "$n" "$was_limited" "$attempts" "$attempts_file" "$branch"
     label_rm "$n" agent:working
     return
   fi
@@ -739,13 +799,16 @@ pick_issue() {
 }
 
 do_issue() {
-  local issue=$1 n title branch base main_sha job comments was_limited=false resume_file resume_sha=
+  local issue=$1 n title branch base main_sha job comments was_limited=false resume_file resume_sha= attempts_file attempts
   n=$(jq -r .number <<<"$issue")
   title=$(jq -r .title <<<"$issue")
   branch=agent/issue-$n
   resume_file=$STATE_DIR/issue-$n-resume
+  attempts_file=$STATE_DIR/issue-$n-attempts
   has_label "$issue" agent:rate-limited && was_limited=true
   if [[ $was_limited == true ]] && ! quota_ok "$n"; then return; fi
+  attempts=$(attempts_read "$attempts_file" "$was_limited")
+  rm -f "$attempts_file"
   log "#$n: starting ($title)"
 
   label_rm "$n" agent
@@ -788,7 +851,10 @@ do_issue() {
   run_job "$job" "$branch" "$base"
   # Before any early return: failed runs count toward the issue's total. A run the pre-flight
   # check stopped never started, so it doesn't.
-  [[ $JOB_QUOTA_LOW == true ]] || issue_usage_add "$n"
+  if [[ $JOB_QUOTA_LOW == false ]]; then
+    issue_usage_add "$n"
+    attempts=$((attempts + 1))
+  fi
 
   label_rm "$n" agent:working
 
@@ -808,7 +874,7 @@ do_issue() {
     elif [[ -n $resume_sha ]]; then
       printf '%s\n' "$resume_sha" >"$resume_file"
     fi
-    rate_limit_requeue "$n" "$was_limited" "$pushed_to"
+    rate_limited_again issue "$n" "$was_limited" "$attempts" "$attempts_file" "$pushed_to"
     return
   fi
 

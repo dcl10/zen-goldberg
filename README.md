@@ -42,8 +42,8 @@ comments and reviews to the model. It never creates issues, edits issue bodies o
 | `agent:review` | A PR is open for this issue. If the run stopped early (turn limit, timeout, an error) after making commits, the PR is a **draft** saying so: the bot leaves drafts alone, so check the work and mark it ready for review before approving or requesting changes. |
 | `agent:blocked` | Waiting on open `Blocked by` issues (native dependencies or `Blocked by #N` / `Depends on #N` in the body). |
 | `agent:needs-info` | The bot asked questions in a comment. Answer, then re-add `agent`. |
-| `agent:failed` | The run failed without usable commits (or its push failed); see its comment. Re-add `agent` to retry. |
-| `agent:rate-limited` | Not enough model quota: the pre-flight check found under `min_quota_tokens` left, or the provider refused the run (HTTP 429). The bot runs no model jobs for `rate_limit_backoff` seconds (default 15 minutes), then checks the quota again, and keeps checking at that interval until enough is free. It then retries this by itself, carrying on from any commits the cut-short run made. Each retry that runs and gets limited again comments with its progress. Checks that find too little quota leave the issue untouched. Remove the label to cancel. |
+| `agent:failed` | The run failed without usable commits (or its push failed), or it used up `max_attempts` rate-limited runs; see its comment. Re-add `agent` to retry. |
+| `agent:rate-limited` | Not enough model quota: the pre-flight check found under `min_quota_tokens` left, or the provider refused the run (HTTP 429). The bot runs no model jobs for `rate_limit_backoff` seconds (default 15 minutes), then checks the quota again, and keeps checking at that interval until `retry_quota_tokens` (default 4.5M, the full bucket) are free. It then retries this by itself, carrying on from any commits the cut-short run made. Each retry that runs and gets limited again comments with its progress (attempt N of `max_attempts`); when the last attempt (default 5) is limited too, the bot comments that it reached the limit and marks it `agent:failed`. Checks that find too little quota leave the issue untouched. Remove the label to cancel. |
 
 ## Setup
 
@@ -130,7 +130,8 @@ get `agent:blocked` and wait until the first PR merges.
   Before each job, `run-claude.sh` makes a 1-token request and skips the job if fewer than
   `min_quota_tokens` are left. Claude Code retries a request only `model_max_retries` times, so
   a 429 mid-run ends the run quickly and the bot requeues it, instead of the run crawling from
-  retry to retry until `job_timeout`. See what's left:
+  retry to retry until `job_timeout`. The requeued retry waits for `retry_quota_tokens` (the
+  full bucket), and an issue or PR gets at most `max_attempts` runs per queueing. See what's left:
   `curl -s -o /dev/null -D - https://inference.do-ai.run/v1/messages -H "x-api-key: $KEY" -H 'anthropic-version: 2023-06-01' -H 'content-type: application/json' -d '{"model":"anthropic-claude-5-sonnet","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}' | grep -i remaining-tokens-per-day`
 - A run the job timeout kills is reported as "timed out after …", with its API retries, its last
   message and the tokens it used up to then.

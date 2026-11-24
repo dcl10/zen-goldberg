@@ -21,8 +21,11 @@ max_turns     = 80
 job_timeout   = "45m"
 poll_interval = "3min"
 # Quota: don't start a run with under ~2M tokens of DO's daily quota left; look again every 15 min.
+# A rate-limited retry waits for the full ~4.5M bucket, and gives up after 5 runs.
 min_quota_tokens   = 2000000
 rate_limit_backoff = 900
+retry_quota_tokens = 4500000
+max_attempts       = 5
 model_max_retries  = 3
 
 # GitHub
