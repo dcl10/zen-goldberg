@@ -15,6 +15,8 @@ locals {
     AGENT_AUTO_MERGE="${var.auto_merge_on_approval}"
     AGENT_MIN_QUOTA_TOKENS="${var.min_quota_tokens}"
     AGENT_RATE_LIMIT_BACKOFF="${var.rate_limit_backoff}"
+    AGENT_RETRY_QUOTA_TOKENS="${var.retry_quota_tokens}"
+    AGENT_MAX_ATTEMPTS="${var.max_attempts}"
     AGENT_MODEL_IDS='${jsonencode(var.model_overrides)}'
     GH_TOKEN="${var.bot_github_token}"
   EOT

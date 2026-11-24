@@ -179,13 +179,35 @@ variable "min_quota_tokens" {
 }
 
 variable "rate_limit_backoff" {
-  description = "Seconds without model jobs after a run is rate-limited or stopped by the quota check; then the quota is checked again (a 1-token request, no label changes) until min_quota_tokens are free. So this is how often to look, not how long to rest."
+  description = "Seconds without model jobs after a run is rate-limited or stopped by the quota check; then the quota is checked again (a 1-token request, no label changes) until retry_quota_tokens are free. So this is how often to look, not how long to rest."
   type        = number
   default     = 900
 
   validation {
     condition     = var.rate_limit_backoff >= 60 && var.rate_limit_backoff == floor(var.rate_limit_backoff)
     error_message = "rate_limit_backoff must be a whole number of seconds, 60 or more."
+  }
+}
+
+variable "retry_quota_tokens" {
+  description = "A rate-limited issue or PR is retried only once the model key has at least this many tokens of DO's daily quota left: a full bucket, so the retry isn't cut short again. DO's bucket holds ~4.5M at once. Set it no higher than the bucket can hold, or retries never start. 0 turns the check off."
+  type        = number
+  default     = 4500000
+
+  validation {
+    condition     = var.retry_quota_tokens >= 0 && var.retry_quota_tokens < 1000000000000 && var.retry_quota_tokens == floor(var.retry_quota_tokens)
+    error_message = "retry_quota_tokens must be a whole number, 0 or more."
+  }
+}
+
+variable "max_attempts" {
+  description = "Runs the bot gets at an issue or PR each time it's queued (the agent label, or a changes-requested review). A run that is rate-limited on the last attempt marks it agent:failed with a comment instead of queueing another retry."
+  type        = number
+  default     = 5
+
+  validation {
+    condition     = var.max_attempts >= 1 && var.max_attempts <= 9999 && var.max_attempts == floor(var.max_attempts)
+    error_message = "max_attempts must be a whole number from 1 to 9999."
   }
 }
 
